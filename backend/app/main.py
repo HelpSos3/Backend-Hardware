@@ -7,6 +7,7 @@ from fastapi.responses import Response
 from .models import create_tables
 from .routers import products, categories, idcard_proxy
 from .routers import purchases, purchase_items, payments
+from .routers import hardware_proxy
 
 app = FastAPI(title="Scrap Shop Backend")
 
@@ -37,6 +38,9 @@ def preflight_handler(full_path: str) -> Response:
 @app.on_event("startup")
 def on_startup():
     create_tables()
+
+app.include_router(hardware_proxy.router)
+
 
 # include routers
 app.include_router(categories.router)

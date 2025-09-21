@@ -226,21 +226,46 @@ def add_item_with_capture(
     )
 
 
-# ---------- Delete a photo ----------
-@router.delete("/{purchase_id}/items/{item_id}/photos/{photo_id}", status_code=204)
-def delete_item_photo(
+@router.delete("/{purchase_id}/items/{item_id}", status_code=204)
+def delete_purchase_item(
     purchase_id: int,
     item_id: int,
-    photo_id: int,
     db: Session = Depends(get_db),
 ):
     ensure_open(db, purchase_id)
-    row = db.execute(text("""
-      DELETE FROM purchase_item_photos
-       WHERE photo_id=:pid AND purchase_item_id=:iid
-      """), {"pid": photo_id, "iid": item_id})
+
+    # ดึงรูปทั้งหมดของ item ก่อน
+    photos = db.execute(
+        text("SELECT img_path FROM purchase_item_photos WHERE purchase_item_id=:iid"),
+        {"iid": item_id}
+    ).mappings().all()
+
+    # ลบ row รูปใน DB
+    db.execute(
+        text("DELETE FROM purchase_item_photos WHERE purchase_item_id=:iid"),
+        {"iid": item_id}
+    )
+
+    # ลบ item ออกจาก DB
+    row = db.execute(
+        text("DELETE FROM purchase_items WHERE purchase_id=:pid AND purchase_item_id=:iid"),
+        {"pid": purchase_id, "iid": item_id}
+    )
     db.commit()
+
     if row.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Photo not found")
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # ลบไฟล์จริงในดิสก์
+    for p in photos:
+        safe_rel = p["img_path"].replace("/uploads/", "").replace("..", "").lstrip("/\\")
+        abs_path = os.path.join(UPLOAD_ROOT, safe_rel)
+        try:
+            if os.path.isfile(abs_path):
+                os.remove(abs_path)
+        except Exception:
+            pass
+
+    return Response(status_code=204)
 
 

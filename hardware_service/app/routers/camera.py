@@ -1,6 +1,6 @@
 # hardware_service/app/routers/camera.py
 from fastapi import APIRouter, Response, HTTPException, Query
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse , JSONResponse
 import cv2, time, numpy as np
 from typing import Generator, Optional
 
@@ -105,3 +105,22 @@ def preview(
                 pass
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@router.get("/status")
+def camera_status(device_index: int = Query(0, description="index กล้อง 0,1,...")):
+    cap = _open_cam(device_index)
+    if cap is None:
+        return {"status": "disconnected", "message": "ไม่สามารถเชื่อมต่อกล้องได้"}
+    try:
+        ok, _ = cap.read()
+        if not ok:
+            return {"status": "error", "message": "เปิดกล้องได้ แต่ไม่สามารถอ่านภาพได้"}
+        return {"status": "connected", "message": "กล้องพร้อมใช้งาน"}
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+
