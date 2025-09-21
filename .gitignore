@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Docker
+*.log
+db_data/
+uploads/
+
+
+# OS
+.DS_Store
+Thumbs.db
