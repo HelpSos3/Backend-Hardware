@@ -74,6 +74,13 @@ class PaginatedCustomers(BaseModel):
     page_size: int
     total_pages: int
 
+class CommitIdCardIn(BaseModel):
+    full_name: Optional[str] = None
+    national_id: str
+    address: Optional[str] = None
+    photo_base64: Optional[str] = None
+    on_open: str = "return"          # "return" | "delete_then_new" | "error"
+    confirm_delete: bool = False
     
            
 
@@ -172,19 +179,38 @@ def get_open_purchase(db: Session = Depends(get_db)):
     return out
 
 
-
-# ====== quick-open idcard ======
-@router.post("/quick-open/idcard", response_model=PurchaseOut, status_code=201)
-def quick_open_with_idcard(
+@router.post("/quick-open/idcard/preview", response_model=IdCardPreviewOut)
+def idcard_preview(
     reader_index: int = Query(0),
     with_photo: int = Query(1),
-    on_open: str = Query("return"),
-    confirm_delete: bool = Query(False),
+):
+    try:
+        r = requests.get(
+            f"{HARDWARE_URL}/idcard/scan",
+            params={"reader_index": reader_index, "with_photo": with_photo},
+            timeout=30,
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"hardware error: {e}")
+
+    p = r.json()  # { full_name, national_id, address, photo_base64? }
+    return IdCardPreviewOut(
+        full_name=p.get("full_name"),
+        national_id=p.get("national_id"),
+        address=p.get("address"),
+        photo_base64=p.get("photo_base64")
+    )
+
+@router.post("/quick-open/idcard/commit", response_model=PurchaseOut, status_code=201)
+def idcard_commit(
+    payload: CommitIdCardIn,
     db: Session = Depends(get_db),
 ):
+    # ถ้ามีใบ OPEN ค้าง → ทำตามนโยบาย
     open_row = _get_open_with_customer(db)
     if open_row:
-        if on_open == "return":
+        if payload.on_open == "return":
             cust = _get_customer_by_id(db, open_row["customer_id"]) if open_row["customer_id"] else None
             return PurchaseOut(
                 purchase_id=open_row["purchase_id"],
@@ -199,36 +225,37 @@ def quick_open_with_idcard(
                 resumed=True,
                 notice="มีบิลค้างอยู่",
             )
-        if on_open == "delete_then_new":
-            if not confirm_delete:
+        if payload.on_open == "delete_then_new":
+            if not payload.confirm_delete:
                 raise HTTPException(status_code=400, detail="ต้อง confirm_delete=true")
-            db.execute(text("DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"),
-                       {"pid": open_row["purchase_id"]})
+            db.execute(text(
+                "DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"
+            ), {"pid": open_row["purchase_id"]})
             db.commit()
-        if on_open == "error":
+        if payload.on_open == "error":
             raise HTTPException(status_code=409, detail="มีบิลค้างอยู่")
 
-    # scan idcard
-    try:
-        r = requests.get(f"{HARDWARE_URL}/idcard/scan", params={"reader_index": reader_index, "with_photo": with_photo}, timeout=30)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"hardware error: {e}")
-    payload = r.json()
-    national_id = (payload.get("national_id") or "").strip()
-    full_name = (payload.get("full_name") or "").strip()
-    address = payload.get("address") or None
-    if not national_id:
-        raise HTTPException(status_code=400, detail="ไม่พบ national_id")
+    # ตรวจข้อมูลจาก preview
+    nid = (payload.national_id or "").strip()
+    if not nid:
+        raise HTTPException(status_code=400, detail="ต้องมี national_id")
+    full_name = (payload.full_name or "").strip()
+    address = (payload.address or None)
 
-    cid = _upsert_customer_by_idcard(db, full_name, national_id, address)
+    # upsert ลูกค้าตามเลขบัตร
+    cid = _upsert_customer_by_idcard(db, full_name, nid, address)
+
+    # บันทึกรูปบัตร ถ้าส่งมา
     photo_path = None
-    if with_photo and payload.get("photo_base64"):
-        photo_path = _save_idcard_photo_if_present(db, cid, payload["photo_base64"])
+    if payload.photo_base64:
+        photo_path = _save_idcard_photo_if_present(db, cid, payload.photo_base64)
 
+    # เปิดบิล
     try:
-        row = db.execute(text("INSERT INTO purchases (customer_id) VALUES (:cid) RETURNING purchase_id,customer_id,purchase_date,purchase_status,updated_at"),
-                         {"cid": cid}).mappings().first()
+        row = db.execute(text(
+            "INSERT INTO purchases (customer_id) VALUES (:cid) "
+            "RETURNING purchase_id,customer_id,purchase_date,purchase_status,updated_at"
+        ), {"cid": cid}).mappings().first()
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -262,7 +289,7 @@ def quick_open_with_idcard(
         customer_address=(cust["customer_address"] if cust else None),
         photo_path=photo_path or _get_latest_customer_photo(db, cid),
         resumed=False,
-        notice="เปิดบิลใหม่เรียบร้อย (idcard)",
+        notice="เปิดบิลใหม่เรียบร้อย (idcard via preview/commit)",
     )
 
 # ====== quick-open existing ======
