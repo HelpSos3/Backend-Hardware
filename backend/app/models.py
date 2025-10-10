@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS product (
     prod_name VARCHAR(255),
     prod_price DECIMAL(10, 2) CHECK (prod_price IS NULL OR prod_price >= 0),
     category_id INT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
     FOREIGN KEY (category_id) REFERENCES product_categories(category_id)
 );
 
@@ -94,12 +95,26 @@ CREATE TABLE IF NOT EXISTS stock_sales (
 -- Unique Index กันชื่อหมวดหมู่ซ้ำ (ไม่แยกตัวพิมพ์)
 CREATE UNIQUE INDEX IF NOT EXISTS ux_product_categories_lower_name
     ON product_categories (LOWER(category_name));
+
+-- ตารางสรุปรวมน้ำหนักต่อสินค้า
+CREATE TABLE IF NOT EXISTS product_inventory_totals (
+    prod_id INT PRIMARY KEY REFERENCES product(prod_id) ON DELETE CASCADE,
+    purchased_weight DECIMAL(14,2) NOT NULL DEFAULT 0,
+    sold_weight      DECIMAL(14,2) NOT NULL DEFAULT 0,
+    balance_weight   DECIMAL(14,2) GENERATED ALWAYS AS (purchased_weight - sold_weight) STORED
+);
+
+CREATE INDEX IF NOT EXISTS ix_product_inventory_totals_balance
+    ON product_inventory_totals (balance_weight);
+
 """
 
 def create_tables():
     with engine.begin() as conn:
+        # 1) สร้างทุกตารางและดัชนีพื้นฐาน
         conn.exec_driver_sql(DDL)
-        # ทริกเกอร์อัปเดต updated_at อัตโนมัติเมื่อมีการ UPDATE
+
+        # 2) ทริกเกอร์อัปเดต updated_at อัตโนมัติเมื่อ UPDATE purchases
         conn.exec_driver_sql("""
         CREATE OR REPLACE FUNCTION trg_set_updated_at() RETURNS TRIGGER AS $$
         BEGIN
@@ -112,8 +127,135 @@ def create_tables():
         BEFORE UPDATE ON purchases
         FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
         """)
+
+        # 3) Unique partial index (ถ้าธรรมชาติธุรกิจต้องการจำกัด OPEN ได้ครั้งละ 1)
         conn.exec_driver_sql("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_purchases_only_one_open
           ON purchases ((1))
           WHERE purchase_status = 'OPEN';
         """)
+
+        # 4) ทริกเกอร์รวมสต๊อกจาก purchase_items (รับเข้า)
+        conn.exec_driver_sql("""
+        CREATE OR REPLACE FUNCTION trg_upsert_totals_from_purchase_items()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          -- INSERT
+          IF (TG_OP = 'INSERT') THEN
+            INSERT INTO product_inventory_totals (prod_id, purchased_weight)
+            VALUES (NEW.prod_id, COALESCE(NEW.weight, 0))
+            ON CONFLICT (prod_id) DO UPDATE
+              SET purchased_weight = product_inventory_totals.purchased_weight
+                                    + COALESCE(EXCLUDED.purchased_weight,0);
+            RETURN NEW;
+          END IF;
+
+          -- DELETE
+          IF (TG_OP = 'DELETE') THEN
+            INSERT INTO product_inventory_totals (prod_id, purchased_weight)
+            VALUES (OLD.prod_id, -COALESCE(OLD.weight, 0))
+            ON CONFLICT (prod_id) DO UPDATE
+              SET purchased_weight = product_inventory_totals.purchased_weight
+                                    + COALESCE(EXCLUDED.purchased_weight,0);
+            RETURN OLD;
+          END IF;
+
+          -- UPDATE (อาจเปลี่ยน prod_id หรือ weight)
+          IF (TG_OP = 'UPDATE') THEN
+            IF (NEW.prod_id = OLD.prod_id) THEN
+              INSERT INTO product_inventory_totals (prod_id, purchased_weight)
+              VALUES (NEW.prod_id, COALESCE(NEW.weight,0) - COALESCE(OLD.weight,0))
+              ON CONFLICT (prod_id) DO UPDATE
+                SET purchased_weight = product_inventory_totals.purchased_weight
+                                      + COALESCE(EXCLUDED.purchased_weight,0);
+            ELSE
+              -- ย้ายสินค้า: หักของเก่า เพิ่มของใหม่
+              INSERT INTO product_inventory_totals (prod_id, purchased_weight)
+              VALUES
+                (OLD.prod_id, -COALESCE(OLD.weight,0)),
+                (NEW.prod_id,  COALESCE(NEW.weight,0))
+              ON CONFLICT (prod_id) DO UPDATE
+                SET purchased_weight = product_inventory_totals.purchased_weight
+                                      + COALESCE(EXCLUDED.purchased_weight,0);
+            END IF;
+            RETURN NEW;
+          END IF;
+
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS purchase_items_totals_aiud ON purchase_items;
+        CREATE TRIGGER purchase_items_totals_aiud
+        AFTER INSERT OR UPDATE OR DELETE ON purchase_items
+        FOR EACH ROW EXECUTE FUNCTION trg_upsert_totals_from_purchase_items();
+        """)
+
+        # 5) ทริกเกอร์รวมสต๊อกจาก stock_sales (ขายออก)
+        conn.exec_driver_sql("""
+        CREATE OR REPLACE FUNCTION trg_upsert_totals_from_stock_sales()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          -- INSERT
+          IF (TG_OP = 'INSERT') THEN
+            INSERT INTO product_inventory_totals (prod_id, sold_weight)
+            VALUES (NEW.prod_id, COALESCE(NEW.weight_sold, 0))
+            ON CONFLICT (prod_id) DO UPDATE
+              SET sold_weight = product_inventory_totals.sold_weight
+                               + COALESCE(EXCLUDED.sold_weight,0);
+            RETURN NEW;
+          END IF;
+
+          -- DELETE
+          IF (TG_OP = 'DELETE') THEN
+            INSERT INTO product_inventory_totals (prod_id, sold_weight)
+            VALUES (OLD.prod_id, -COALESCE(OLD.weight_sold, 0))
+            ON CONFLICT (prod_id) DO UPDATE
+              SET sold_weight = product_inventory_totals.sold_weight
+                               + COALESCE(EXCLUDED.sold_weight,0);
+            RETURN OLD;
+          END IF;
+
+          -- UPDATE (อาจเปลี่ยน prod_id หรือ weight_sold)
+          IF (TG_OP = 'UPDATE') THEN
+            IF (NEW.prod_id = OLD.prod_id) THEN
+              INSERT INTO product_inventory_totals (prod_id, sold_weight)
+              VALUES (NEW.prod_id, COALESCE(NEW.weight_sold,0) - COALESCE(OLD.weight_sold,0))
+              ON CONFLICT (prod_id) DO UPDATE
+                SET sold_weight = product_inventory_totals.sold_weight
+                                 + COALESCE(EXCLUDED.sold_weight,0);
+            ELSE
+              INSERT INTO product_inventory_totals (prod_id, sold_weight)
+              VALUES
+                (OLD.prod_id, -COALESCE(OLD.weight_sold,0)),
+                (NEW.prod_id,  COALESCE(NEW.weight_sold,0))
+              ON CONFLICT (prod_id) DO UPDATE
+                SET sold_weight = product_inventory_totals.sold_weight
+                                 + COALESCE(EXCLUDED.sold_weight,0);
+            END IF;
+            RETURN NEW;
+          END IF;
+
+          RETURN NULL;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS stock_sales_totals_aiud ON stock_sales;
+        CREATE TRIGGER stock_sales_totals_aiud
+        AFTER INSERT OR UPDATE OR DELETE ON stock_sales
+        FOR EACH ROW EXECUTE FUNCTION trg_upsert_totals_from_stock_sales();
+        """)
+
+        # 6) Backfill ยอดเริ่มต้นจากข้อมูลเดิม (ถ้ามี)
+        conn.exec_driver_sql("""
+        INSERT INTO product_inventory_totals (prod_id, purchased_weight, sold_weight)
+        SELECT
+          p.prod_id,
+          COALESCE((SELECT SUM(pi.weight) FROM purchase_items pi WHERE pi.prod_id = p.prod_id), 0),
+          COALESCE((SELECT SUM(ss.weight_sold) FROM stock_sales ss WHERE ss.prod_id = p.prod_id), 0)
+        FROM product p
+        ON CONFLICT (prod_id) DO UPDATE
+          SET purchased_weight = EXCLUDED.purchased_weight,
+              sold_weight      = EXCLUDED.sold_weight;
+        """)
+

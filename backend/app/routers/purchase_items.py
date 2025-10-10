@@ -82,7 +82,7 @@ class ProductOut(BaseModel):
     prod_id: int
     prod_name: str
     prod_price: Decimal
-    unit: Optional[str] = None
+    is_active: bool
 
 # ---------- Photo Helpers ----------
 def _save_item_photos(item_id: int, files: List[UploadFile] | None, db: Session) -> List[PhotoOut]:
@@ -121,17 +121,36 @@ def _get_item_photos(db: Session, item_id: int) -> List[PhotoOut]:
     ).mappings().all()
     return [PhotoOut(photo_id=r["photo_id"], img_path=r["img_path"]) for r in rows]
 
-# ---------- 0) รายละเอียดสินค้า (หลังเลือกใน UI) ----------
-@router.get("/products/{prod_id}", response_model=ProductOut)
-def get_product_detail(prod_id: int, db: Session = Depends(get_db)):
-    prod = db.execute(
-        text("""SELECT prod_id, prod_name, prod_price, unit
-                FROM product WHERE prod_id=:id"""),
-        {"id": prod_id}
-    ).mappings().first()
-    if not prod:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return ProductOut(**dict(prod))
+# ---------- 0a) ดึงสินค้าที่รับซื้อทั้งหมด (ค้นหา/กรอง/เพจ) ----------
+@router.get("/products", response_model=List[ProductOut])
+def list_purchase_products(
+    q: Optional[str] = Query(None, description="ค้นหาชื่อสินค้า (contains)"),
+    include_inactive: bool = Query(False, description="รวมสินค้าที่ปิดใช้งาน"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    # หากมีคอลัมน์ is_active ใช้เงื่อนไขนี้ได้เลย
+    
+    sql = """
+        SELECT prod_id, prod_name, prod_price, is_active
+        FROM product
+        WHERE (:include_inactive = TRUE OR COALESCE(is_active, TRUE) = TRUE)
+          AND (:q IS NULL OR LOWER(prod_name) LIKE LOWER(:q_like))
+        ORDER BY prod_name ASC, prod_id ASC
+        LIMIT :limit OFFSET :offset
+    """
+    rows = db.execute(
+        text(sql),
+        {
+            "include_inactive": include_inactive,
+            "q": q,
+            "q_like": f"%{q}%" if q else None,
+            "limit": limit,
+            "offset": offset,
+        },
+    ).mappings().all()
+    return [ProductOut(**dict(r)) for r in rows]
 
 # ---------- 1) ดูรายการของบิล ----------
 @router.get("/{purchase_id}/items", response_model=List[ItemOut])
@@ -309,3 +328,5 @@ def delete_purchase_item(
             pass
 
     return Response(status_code=204)
+
+
