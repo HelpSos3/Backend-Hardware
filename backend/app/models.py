@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS purchases (
     customer_id INT,
     purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     purchase_status VARCHAR(10) NOT NULL DEFAULT 'OPEN'
-      CHECK (purchase_status IN ('OPEN','PAID','VOID')),
+      CHECK (purchase_status IN ('OPEN','DONE')),
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );

@@ -7,9 +7,7 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import os, uuid, shutil
-from typing import Optional, List 
 from fastapi import Query
-from pydantic import BaseModel
 from app.database import SessionLocal
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -71,6 +69,7 @@ class ProductOut(BaseModel):
     prod_price: Decimal
     category_id: int
     category_name: Optional[str] = None
+    is_active: bool
 
 class ProductCreate(BaseModel):
     prod_img: Optional[str] = None
@@ -90,21 +89,25 @@ class ProductOption(BaseModel):
 
 # ====== LIST ======
 @router.get("/", response_model=List[ProductOut])
-def list_products(db: Session = Depends(get_db)):
+def list_products(
+    include_inactive: bool = Query(False, description="แสดงสินค้าที่ปิดใช้งานด้วยหรือไม่"),
+    db: Session = Depends(get_db),
+):
     sql = """
-    SELECT
-      p.prod_id,
-      p.prod_img,
-      p.prod_name,
-      p.prod_price,
-      p.category_id,
-      c.category_name
-    FROM product p
-    LEFT JOIN product_categories c
-      ON c.category_id = p.category_id
-    ORDER BY p.prod_id ASC
+        SELECT
+            p.prod_id,
+            p.prod_img,
+            p.prod_name,
+            p.prod_price,
+            p.category_id,
+            p.is_active,
+            c.category_name
+        FROM product p
+        LEFT JOIN product_categories c ON c.category_id = p.category_id
+        WHERE (:include_inactive = TRUE OR p.is_active = TRUE)
+        ORDER BY p.prod_id ASC
     """
-    rows = db.execute(text(sql)).mappings().all()
+    rows = db.execute(text(sql), {"include_inactive": include_inactive}).mappings().all()
     return rows
 
 # ====== CREATE (multipart/form-data รองรับ imageFile) ======
@@ -132,7 +135,7 @@ async def create_product(
         text("""
             INSERT INTO product (prod_img, prod_name, prod_price, category_id)
             VALUES (:img, :name, :price, :cid)
-            RETURNING prod_id, prod_img, prod_name, prod_price, category_id
+            RETURNING prod_id, prod_img, prod_name, prod_price, category_id, is_active
         """),
         {
             "img": img_rel,
@@ -192,7 +195,7 @@ async def update_product(
                    prod_price = :price,
                    category_id = :cid
              WHERE prod_id = :pid
-         RETURNING prod_id, prod_img, prod_name, prod_price, category_id
+         RETURNING prod_id, prod_img, prod_name, prod_price, category_id , is_active
         """),
         {
             "img": new_img_rel,
@@ -264,7 +267,7 @@ async def patch_product(
                    prod_price = :price,
                    category_id = :cid
              WHERE prod_id = :pid
-         RETURNING prod_id, prod_img, prod_name, prod_price, category_id
+         RETURNING prod_id, prod_img, prod_name, prod_price, category_id, is_active
         """),
         new_vals,
     ).mappings().first()
@@ -305,17 +308,18 @@ def delete_product(prod_id: int, db: Session = Depends(get_db)):
 @router.get("/by-category/{category_id}", response_model=List[ProductOut])
 def list_products_by_category(category_id: int, db: Session = Depends(get_db)):
     sql = """
-      SELECT p.prod_id,
-             p.prod_img,
-             p.prod_name,
-             p.prod_price,
-             p.category_id,
-             c.category_name
-      FROM product p
-      LEFT JOIN product_categories c
-        ON c.category_id = p.category_id
-      WHERE p.category_id = :cid
-      ORDER BY p.prod_name ASC, p.prod_id ASC
+        SELECT
+            p.prod_id,
+            p.prod_img,
+            p.prod_name,
+            p.prod_price,
+            p.category_id,
+            p.is_active,
+            c.category_name
+        FROM product p
+        LEFT JOIN product_categories c ON c.category_id = p.category_id
+        WHERE p.category_id = :cid
+        ORDER BY p.prod_name ASC, p.prod_id ASC
     """
     rows = db.execute(text(sql), {"cid": category_id}).mappings().all()
     return rows
@@ -334,6 +338,7 @@ def search_products_by_name(
         p.prod_name,
         p.prod_price,
         p.category_id,
+        p.is_active,
         c.category_name
       FROM product p
       LEFT JOIN product_categories c
@@ -347,3 +352,32 @@ def search_products_by_name(
         {"q": f"%{q.strip()}%", "limit": limit, "offset": offset},
     ).mappings().all()
     return rows
+
+@router.put("/{prod_id}/active", response_model=ProductOut)
+def toggle_product_active(prod_id: int, is_active: bool, db: Session = Depends(get_db)):
+    current = db.execute(
+        text("SELECT * FROM product WHERE prod_id = :pid"),
+        {"pid": prod_id}
+    ).mappings().first()
+    if not current:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    row = db.execute(
+        text("""
+            UPDATE product
+               SET is_active = :active
+             WHERE prod_id = :pid
+         RETURNING prod_id, prod_img, prod_name, prod_price, category_id, is_active
+        """),
+        {"pid": prod_id, "active": is_active}
+    ).mappings().first()
+    db.commit()
+
+    cat = db.execute(
+        text("SELECT category_name FROM product_categories WHERE category_id = :cid"),
+        {"cid": row["category_id"]}
+    ).mappings().first()
+
+    result = dict(row)
+    result["category_name"] = cat["category_name"] if cat else None
+    return result
