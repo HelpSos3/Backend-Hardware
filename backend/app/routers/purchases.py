@@ -539,3 +539,12 @@ def list_customers(
         "page_size": page_size,
         "total_pages": math.ceil(total / page_size),
     }
+
+@router.delete("/open")
+def delete_open_purchase(confirm: bool = Query(False), db: Session = Depends(get_db)):
+    if not confirm: raise HTTPException(status_code=400, detail="ต้องส่ง confirm=true")
+    r = _get_open_with_customer(db)
+    if not r: raise HTTPException(status_code=404, detail="ไม่พบบิล OPEN")
+    db.execute(text("DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"), {"pid": r["purchase_id"]})
+    db.commit()
+    return {"ok": True, "deleted_purchase_id": r["purchase_id"]}

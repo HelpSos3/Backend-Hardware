@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 
 from .models import create_tables
-from .routers import products, categories, idcard_proxy
+from .routers import products, categories
 from .routers import purchases, purchase_items, payments
 from .routers import hardware_proxy
 
@@ -45,7 +45,6 @@ app.include_router(hardware_proxy.router)
 # include routers
 app.include_router(categories.router)
 app.include_router(products.router)
-app.include_router(idcard_proxy.router)
 
 app.include_router(purchases.router)
 app.include_router(purchase_items.router)
