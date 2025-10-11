@@ -307,21 +307,21 @@ def quick_open_existing(
 
     # ถ้ามีใบ OPEN อยู่แล้ว
     open_row = _get_open_with_customer(db)
-    if open_row:
-        if on_open == "return":
-            return PurchaseOut(
-                purchase_id=open_row["purchase_id"],
-                customer_id=open_row["customer_id"],
-                purchase_date=open_row["purchase_date"],
-                purchase_status=open_row["purchase_status"],
-                updated_at=open_row["updated_at"],
-                customer_name=open_row["customer_name"],
-                customer_national_id=cust["customer_national_id"],
-                customer_address=cust["customer_address"],
-                photo_path=_get_latest_customer_photo(db, open_row["customer_id"]),
-                resumed=True,
-                notice="มีบิลค้างอยู่",
-            )
+    if on_open == "return":
+        open_cust = _get_customer_by_id(db, open_row["customer_id"]) if open_row["customer_id"] else None
+        return PurchaseOut(
+            purchase_id=open_row["purchase_id"],
+            customer_id=open_row["customer_id"],
+            purchase_date=open_row["purchase_date"],
+            purchase_status=open_row["purchase_status"],
+            updated_at=open_row["updated_at"],
+            customer_name=open_row["customer_name"],
+            customer_national_id=(open_cust["customer_national_id"] if open_cust else None),
+            customer_address=(open_cust["customer_address"] if open_cust else None),
+            photo_path=_get_latest_customer_photo(db, open_row["customer_id"]),
+            resumed=True,
+            notice="มีบิลค้างอยู่",
+    )
         if on_open == "delete_then_new":
             if not confirm_delete:
                 raise HTTPException(status_code=400, detail="ต้อง confirm_delete=true")

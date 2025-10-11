@@ -83,6 +83,7 @@ class ProductOut(BaseModel):
     prod_name: str
     prod_price: Decimal
     is_active: bool
+    prod_img: Optional[str] = None
 
 # ---------- Photo Helpers ----------
 def _save_item_photos(item_id: int, files: List[UploadFile] | None, db: Session) -> List[PhotoOut]:
@@ -130,10 +131,8 @@ def list_purchase_products(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    # หากมีคอลัมน์ is_active ใช้เงื่อนไขนี้ได้เลย
-    
     sql = """
-        SELECT prod_id, prod_name, prod_price, is_active
+        SELECT prod_id, prod_name, prod_price, is_active, prod_img
         FROM product
         WHERE (:include_inactive = TRUE OR COALESCE(is_active, TRUE) = TRUE)
           AND (:q IS NULL OR LOWER(prod_name) LIKE LOWER(:q_like))
@@ -150,7 +149,24 @@ def list_purchase_products(
             "offset": offset,
         },
     ).mappings().all()
-    return [ProductOut(**dict(r)) for r in rows]
+
+    out: List[ProductOut] = []
+    for r in rows:
+        d = dict(r)
+
+        # ถ้าใน DB เก็บเป็นแค่ไฟล์เนม ให้เติม prefix เป็น /uploads/products/ ให้หน้าเว็บโหลดได้
+        img = d.get("prod_img")
+        if img:
+            if img.startswith("/uploads/"):
+                d["prod_img"] = img
+            else:
+                d["prod_img"] = f"/uploads/products/{img}"
+        else:
+            d["prod_img"] = None  # หรือจะใส่ placeholder ก็ได้
+
+        out.append(ProductOut(**d))
+    return out
+
 
 # ---------- 1) ดูรายการของบิล ----------
 @router.get("/{purchase_id}/items", response_model=List[ItemOut])
