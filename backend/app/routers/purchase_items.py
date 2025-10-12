@@ -34,12 +34,6 @@ def get_db():
         db.close()
 
 def _list_cameras_from_hardware() -> list[dict]:
-    """
-    คาดหวังว่า hardware_service มี GET /camera/devices
-    คืนค่าเป็น list ของ { index:int, name:str, path:str, transport:str }
-    เช่น [{"index":0,"name":"Integrated Cam","path":"/dev/video0","transport":"builtin"},
-          {"index":1,"name":"USB2.0 Camera","path":"/dev/video2","transport":"usb"}]
-    """
     try:
         r = requests.get(f"{HARDWARE_URL}/camera/devices", timeout=5)
         r.raise_for_status()
@@ -275,14 +269,16 @@ def add_item(
         "half_up", pattern="^(half_up|up|down)$",
         description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"
     ),
-    # เดิมมี device_index, warmup, width, height
-    device_index: int = Query(0, description="index กล้อง 0,1,... (ใช้เมื่อเลือกอัตโนมัติไม่สำเร็จ)"),
+    # เปลี่ยน default เป็น -1 และอนุญาต ge=-1
+    device_index: int = Query(
+        -1, ge=-1,
+        description="index กล้องที่ผู้ใช้เลือก (-1 = ให้ระบบเลือกอัตโนมัติ)"
+    ),
     warmup: int = Query(8, ge=0, le=30, description="วอร์มกล้อง"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720,  ge=120, le=2160),
 
-    # ใหม่
-    auto_pick_usb: bool = Query(True, description="พยายามเลือกกล้อง USB อัตโนมัติ"),
+    auto_pick_usb: bool = Query(True, description="พยายามเลือกกล้อง USB อัตโนมัติเมื่อ device_index=-1"),
     camera_name_regex: Optional[str] = Query(
         None,
         description="regex สำหรับชื่อ/พาธกล้อง เช่น '.*(Logitech|USB).*'"
@@ -300,28 +296,39 @@ def add_item(
     if not prod:
         raise HTTPException(status_code=400, detail="Product not found")
 
-    # 2) หาว่าจะใช้กล้อง index ไหน
-    chosen_index = None
-    if auto_pick_usb:
-        chosen_index = _pick_usb_camera_index(camera_name_regex=camera_name_regex)
-
-    if chosen_index is None:
-        # fallback มาใช้ค่าที่ผู้ใช้ส่งมา
+    # 2) เลือกกล้อง (priority: ค่าที่ผู้ใช้เลือกมาก่อน)
+    if device_index >= 0:
         chosen_index = device_index
+    else:
+        if auto_pick_usb:
+            chosen_index = _pick_usb_camera_index(camera_name_regex=camera_name_regex)
+            if chosen_index is None:
+                chosen_index = -1  # ให้ hardware_service auto
+        else:
+            # ใช้ ENV_CAMERA_INDEX ถ้ามี ไม่งั้น fallback เป็น 0
+            try:
+                chosen_index = int(ENV_CAMERA_INDEX) if ENV_CAMERA_INDEX is not None else 0
+            except ValueError:
+                chosen_index = 0
 
     # 3) ถ่ายภาพจาก hardware_service
     try:
         r = requests.post(
             f"{HARDWARE_URL}/camera/capture",
             params={
-                "device_index": chosen_index,
+                "device_index": chosen_index,   # อาจเป็นค่าที่ผู้ใช้เลือก หรือ -1 เพื่อ auto
                 "warmup": warmup,
                 "width": width,
                 "height": height,
             },
-            timeout=15,
+            timeout=20,
         )
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                msg = r.json().get("detail")
+            except Exception:
+                msg = r.text
+            raise HTTPException(status_code=502, detail=f"Capture failed: {msg}")
         captured_bytes = r.content
         if not captured_bytes:
             raise HTTPException(status_code=502, detail="No image data from hardware")
@@ -359,6 +366,7 @@ def add_item(
         prod_name=prod["prod_name"],
         photos=[PhotoOut(photo_id=photo["photo_id"], img_path=photo["img_path"])]
     )
+
 
 
 # ---------- 5) แก้ไข "ราคา" เท่านั้น (มีโหมดปัดราคา) ----------
