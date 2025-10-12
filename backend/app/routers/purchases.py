@@ -10,6 +10,7 @@ import httpx
 from app.database import SessionLocal
 import os, uuid, requests, base64
 import math
+from pathlib import Path
 
 
 router = APIRouter(prefix="/purchases", tags=["purchases"])
@@ -540,11 +541,66 @@ def list_customers(
         "total_pages": math.ceil(total / page_size),
     }
 
+def _safe_abs_from_imgpath(img_path: str) -> str:
+    # แปลง "/uploads/xxx" → absolute ภายใต้ UPLOAD_ROOT เท่านั้น
+    rel = img_path.replace("/uploads/", "").lstrip("/\\").replace("..", "")
+    abs_path = str(Path(os.path.join(UPLOAD_ROOT, rel)).resolve())
+    if not abs_path.startswith(str(Path(UPLOAD_ROOT).resolve())):
+        raise HTTPException(status_code=400, detail="Invalid image path")
+    return abs_path
+
 @router.delete("/open")
 def delete_open_purchase(confirm: bool = Query(False), db: Session = Depends(get_db)):
-    if not confirm: raise HTTPException(status_code=400, detail="ต้องส่ง confirm=true")
+    if not confirm:
+        raise HTTPException(status_code=400, detail="ต้องส่ง confirm=true")
+
     r = _get_open_with_customer(db)
-    if not r: raise HTTPException(status_code=404, detail="ไม่พบบิล OPEN")
-    db.execute(text("DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"), {"pid": r["purchase_id"]})
+    if not r:
+        raise HTTPException(status_code=404, detail="ไม่พบบิล OPEN")
+
+    pid = r["purchase_id"]
+
+    # 1) ดึงรายการ path ของรูปที่จะลบทิ้ง (เผื่อไปลบไฟล์หลัง commit)
+    photo_rows = db.execute(text("""
+        SELECT p.img_path
+        FROM purchase_item_photos p
+        JOIN purchase_items i ON i.purchase_item_id = p.purchase_item_id
+        WHERE i.purchase_id = :pid
+    """), {"pid": pid}).mappings().all()
+    photo_paths = [row["img_path"] for row in photo_rows if row.get("img_path")]
+
+    # 2) ลบรูปของรายการ (DB)
+    db.execute(text("""
+        DELETE FROM purchase_item_photos
+        WHERE purchase_item_id IN (
+            SELECT purchase_item_id FROM purchase_items WHERE purchase_id = :pid
+        )
+    """), {"pid": pid})
+
+    # 3) ลบ “รายการสินค้า” ของบิล (DB)
+    db.execute(text("""
+        DELETE FROM purchase_items WHERE purchase_id = :pid
+    """), {"pid": pid})
+
+    # 4) ลบบิล (DB)
+    res = db.execute(text("""
+        DELETE FROM purchases
+        WHERE purchase_id = :pid AND purchase_status = 'OPEN'
+    """), {"pid": pid})
+
     db.commit()
-    return {"ok": True, "deleted_purchase_id": r["purchase_id"]}
+
+    if res.rowcount == 0:
+        raise HTTPException(status_code=409, detail="ลบบิลไม่สำเร็จ (อาจถูกปิดไปแล้ว)")
+
+    # 5) ลบไฟล์จริงในดิสก์ (นอก transaction)
+    for p in photo_paths:
+        try:
+            abs_path = _safe_abs_from_imgpath(p)
+            if os.path.isfile(abs_path):
+                os.remove(abs_path)
+        except Exception:
+            # ไม่ให้ fail ทั้ง API เพราะลบไฟล์บางรูปไม่สำเร็จ
+            pass
+
+    return {"ok": True, "deleted_purchase_id": pid, "deleted_items": True, "deleted_item_photos": True}
