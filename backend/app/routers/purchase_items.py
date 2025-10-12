@@ -9,6 +9,8 @@ from app.database import SessionLocal
 import os, uuid, shutil
 import requests
 from pathlib import Path
+import re
+
 
 router = APIRouter(prefix="/purchases", tags=["purchase_items"])
 
@@ -20,6 +22,9 @@ os.makedirs(ITEM_DIR, exist_ok=True)
 HARDWARE_URL = os.getenv("HARDWARE_URL", "http://host.docker.internal:9000")
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
+ENV_CAMERA_INDEX = os.getenv("CAMERA_DEVICE_INDEX")  # เช่น "1"
+ENV_CAMERA_NAME_REGEX = os.getenv("CAMERA_NAME_REGEX")  # เช่น ".*(USB|Logitech|UVC).*"
+
 # ---------- DB Session ----------
 def get_db():
     db = SessionLocal()
@@ -27,6 +32,69 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def _list_cameras_from_hardware() -> list[dict]:
+    """
+    คาดหวังว่า hardware_service มี GET /camera/devices
+    คืนค่าเป็น list ของ { index:int, name:str, path:str, transport:str }
+    เช่น [{"index":0,"name":"Integrated Cam","path":"/dev/video0","transport":"builtin"},
+          {"index":1,"name":"USB2.0 Camera","path":"/dev/video2","transport":"usb"}]
+    """
+    try:
+        r = requests.get(f"{HARDWARE_URL}/camera/devices", timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        # เผื่อบาง service ห่อใน key
+        if isinstance(data, dict) and "devices" in data and isinstance(data["devices"], list):
+            return data["devices"]
+    except requests.RequestException:
+        pass
+    return []
+
+def _pick_usb_camera_index(camera_name_regex: str | None = None) -> int | None:
+    """
+    เลือก index ของกล้อง USB ตามกติกา:
+      1) ถ้ามี ENV_CAMERA_INDEX ให้ใช้ทันที
+      2) หากมีรายการอุปกรณ์จาก /camera/devices:
+         2.1) ถ้ามี regex ให้เลือกตัวที่ชื่อ match ก่อน
+         2.2) มิฉะนั้น เลือกตัวที่ transport == 'usb' หรือ name/path บอกใบ้ว่าเป็น USB/UVC
+      3) ถ้าเลือกไม่ได้ คืน None
+    """
+    # 1) บังคับจาก ENV
+    if ENV_CAMERA_INDEX:
+        try:
+            return int(ENV_CAMERA_INDEX)
+        except ValueError:
+            pass
+
+    # 2) หาอุปกรณ์จริงจาก hardware_service
+    devices = _list_cameras_from_hardware()
+    if not devices:
+        return None
+
+    # ใช้ regex จาก env ถ้าไม่ส่งมากับฟังก์ชัน
+    if camera_name_regex is None:
+        camera_name_regex = ENV_CAMERA_NAME_REGEX
+
+    pat = re.compile(camera_name_regex, re.IGNORECASE) if camera_name_regex else None
+
+    # 2.1) เลือกจาก regex ก่อน
+    if pat:
+        for d in devices:
+            name = f"{d.get('name','')} {d.get('path','')}"
+            if pat.search(name):
+                return int(d.get("index", 0))
+
+    # 2.2) เลือกตัวที่บอกใบ้ว่าเป็น USB
+    for d in devices:
+        transport = (d.get("transport") or "").lower()
+        name = f"{d.get('name','')} {d.get('path','')}".lower()
+        if transport == "usb" or "usb" in name or "uvc" in name:
+            return int(d.get("index", 0))
+
+    return None        
 
 # ---------- Guards ----------
 def ensure_open(db: Session, purchase_id: int):
@@ -203,12 +271,23 @@ def items_summary(purchase_id: int, db: Session = Depends(get_db)):
 def add_item(
     purchase_id: int,
     body: ItemCreate,
-    round_mode: str = Query("half_up", pattern="^(half_up|up|down)$",
-                            description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"),
-    device_index: int = Query(0, description="index กล้อง 0,1,..."),
+    round_mode: str = Query(
+        "half_up", pattern="^(half_up|up|down)$",
+        description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"
+    ),
+    # เดิมมี device_index, warmup, width, height
+    device_index: int = Query(0, description="index กล้อง 0,1,... (ใช้เมื่อเลือกอัตโนมัติไม่สำเร็จ)"),
     warmup: int = Query(8, ge=0, le=30, description="วอร์มกล้อง"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720,  ge=120, le=2160),
+
+    # ใหม่
+    auto_pick_usb: bool = Query(True, description="พยายามเลือกกล้อง USB อัตโนมัติ"),
+    camera_name_regex: Optional[str] = Query(
+        None,
+        description="regex สำหรับชื่อ/พาธกล้อง เช่น '.*(Logitech|USB).*'"
+    ),
+
     db: Session = Depends(get_db),
 ):
     ensure_open(db, purchase_id)
@@ -221,12 +300,21 @@ def add_item(
     if not prod:
         raise HTTPException(status_code=400, detail="Product not found")
 
-    # 2) บังคับถ่ายภาพ
+    # 2) หาว่าจะใช้กล้อง index ไหน
+    chosen_index = None
+    if auto_pick_usb:
+        chosen_index = _pick_usb_camera_index(camera_name_regex=camera_name_regex)
+
+    if chosen_index is None:
+        # fallback มาใช้ค่าที่ผู้ใช้ส่งมา
+        chosen_index = device_index
+
+    # 3) ถ่ายภาพจาก hardware_service
     try:
         r = requests.post(
             f"{HARDWARE_URL}/camera/capture",
             params={
-                "device_index": device_index,
+                "device_index": chosen_index,
                 "warmup": warmup,
                 "width": width,
                 "height": height,
@@ -240,11 +328,11 @@ def add_item(
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Hardware unreachable: {e}")
 
-    # 3) คำนวณราคา + ปัดตามโหมด
+    # 4) คำนวณราคา + ปัดตามโหมด
     raw_price = body.weight * prod["prod_price"]
-    total_price = _round_money(raw_price, round_mode)
+    total_price = _round_money(Decimal(raw_price), round_mode)
 
-    # 4) บันทึกรายการ
+    # 5) บันทึกรายการ
     item = db.execute(text("""
         INSERT INTO purchase_items (purchase_id, prod_id, weight, price)
         VALUES (:pid, :prod, :w, :p)
@@ -252,8 +340,8 @@ def add_item(
     """), {"pid": purchase_id, "prod": body.prod_id, "w": body.weight, "p": total_price}
     ).mappings().first()
 
-    # 5) บันทึกรูป (ต้องมีอย่างน้อย 1 รูป)
-    fname = f"{uuid.uuid4().hex}.jpg"  # บังคับเป็น jpg
+    # 6) บันทึกรูป (บังคับอย่างน้อย 1 รูป)
+    fname = f"{uuid.uuid4().hex}.jpg"
     abs_path = os.path.join(ITEM_DIR, fname)
     with open(abs_path, "wb") as f:
         f.write(captured_bytes)
