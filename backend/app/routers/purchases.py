@@ -504,12 +504,16 @@ def list_customers(
     page_size: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    where = "TRUE"
+    # ---------------------------
+    # เพิ่มเงื่อนไข: ต้องมีชื่อจริง (กัน NULL และว่าง)
+    where = "c.full_name IS NOT NULL AND c.full_name <> ''"
     params = {}
+
     if q and q.strip():
-        where = "(c.full_name ILIKE :kw OR c.address ILIKE :kw)"
+        where += " AND (c.full_name ILIKE :kw OR c.address ILIKE :kw)"
         params["kw"] = f"%{q.strip()}%"
 
+    # ---------------------------
     total = db.execute(
         text(f"SELECT COUNT(*) AS n FROM customers c WHERE {where}"),
         params
@@ -538,6 +542,7 @@ def list_customers(
         ORDER BY c.full_name NULLS LAST, c.customer_id ASC
         LIMIT :limit OFFSET :offset
     """
+
     rows = db.execute(
         text(sql),
         {**params, "limit": page_size, "offset": offset}
@@ -550,6 +555,7 @@ def list_customers(
         "page_size": page_size,
         "total_pages": math.ceil(total / page_size),
     }
+
 
 def _safe_abs_from_imgpath(img_path: str) -> str:
     # แปลง "/uploads/xxx" → absolute ภายใต้ UPLOAD_ROOT เท่านั้น
