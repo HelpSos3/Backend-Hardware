@@ -59,22 +59,7 @@ def _black_jpeg(w: int, h: int) -> bytes:
     ok, buf = cv2.imencode(".jpg", black)
     return buf.tobytes() if ok else b""
 
-def _first_working_index(width: int, height: int, fps: int, warmup: int) -> Optional[int]:
-    for idx in range(SCAN_MAX + 1):
-        cap = _try_open(idx)
-        if cap is None:
-            continue
-        try:
-            _configure_cap(cap, width, height, fps)
-            _warmup(cap, warmup)
-            ok, frame = cap.read()
-            if ok and frame is not None and frame.size > 0:
-                if np.mean(frame) > 1.0:
-                    return idx
-        finally:
-            try: cap.release()
-            except Exception: pass
-    return None
+
 
 @router.get("/ping", response_class=PlainTextResponse)
 def ping():
