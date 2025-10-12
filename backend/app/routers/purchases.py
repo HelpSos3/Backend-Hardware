@@ -297,48 +297,58 @@ def idcard_commit(
 @router.post("/quick-open/existing", response_model=PurchaseOut, status_code=201)
 def quick_open_existing(
     customer_id: int = Query(...),
-    on_open: str = Query("return"),
+    on_open: str = Query("return"),          # "return" | "delete_then_new" | "error"
     confirm_delete: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    # ตรวจว่าลูกค้ามีจริง
+    # 1) ตรวจว่าลูกค้ามีจริง
     cust = _get_customer_by_id(db, customer_id)
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    # ถ้ามีใบ OPEN อยู่แล้ว
+    # 2) ถ้ามีใบ OPEN อยู่แล้ว → ทำตามนโยบาย on_open
     open_row = _get_open_with_customer(db)
-    if on_open == "return":
-        open_cust = _get_customer_by_id(db, open_row["customer_id"]) if open_row["customer_id"] else None
-        return PurchaseOut(
-            purchase_id=open_row["purchase_id"],
-            customer_id=open_row["customer_id"],
-            purchase_date=open_row["purchase_date"],
-            purchase_status=open_row["purchase_status"],
-            updated_at=open_row["updated_at"],
-            customer_name=open_row["customer_name"],
-            customer_national_id=(open_cust["customer_national_id"] if open_cust else None),
-            customer_address=(open_cust["customer_address"] if open_cust else None),
-            photo_path=_get_latest_customer_photo(db, open_row["customer_id"]),
-            resumed=True,
-            notice="มีบิลค้างอยู่",
-    )
-        if on_open == "delete_then_new":
+    if open_row:   # <-- ต้องเช็คก่อนเสมอ
+        if on_open == "return":
+            open_cust = _get_customer_by_id(db, open_row["customer_id"]) if open_row["customer_id"] else None
+            return PurchaseOut(
+                purchase_id=open_row["purchase_id"],
+                customer_id=open_row["customer_id"],
+                purchase_date=open_row["purchase_date"],
+                purchase_status=open_row["purchase_status"],
+                updated_at=open_row["updated_at"],
+                customer_name=open_row["customer_name"],
+                customer_national_id=(open_cust["customer_national_id"] if open_cust else None),
+                customer_address=(open_cust["customer_address"] if open_cust else None),
+                photo_path=_get_latest_customer_photo(db, open_row["customer_id"]),
+                resumed=True,
+                notice="มีบิลค้างอยู่",
+            )
+        elif on_open == "delete_then_new":
             if not confirm_delete:
                 raise HTTPException(status_code=400, detail="ต้อง confirm_delete=true")
-            db.execute(text("DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"),
-                       {"pid": open_row["purchase_id"]})
+            db.execute(
+                text("DELETE FROM purchases WHERE purchase_id=:pid AND purchase_status='OPEN'"),
+                {"pid": open_row["purchase_id"]},
+            )
             db.commit()
-        if on_open == "error":
+        elif on_open == "error":
             raise HTTPException(status_code=409, detail="มีบิลค้างอยู่")
 
-    # เปิดบิลใหม่
+    # 3) เปิดบิลใหม่ให้ลูกค้าที่เลือก
     try:
-        row = db.execute(text("INSERT INTO purchases (customer_id) VALUES (:cid) RETURNING purchase_id,customer_id,purchase_date,purchase_status,updated_at"),
-                         {"cid": customer_id}).mappings().first()
+        row = db.execute(
+            text("""
+                INSERT INTO purchases (customer_id)
+                VALUES (:cid)
+                RETURNING purchase_id, customer_id, purchase_date, purchase_status, updated_at
+            """),
+            {"cid": customer_id},
+        ).mappings().first()
         db.commit()
     except IntegrityError:
         db.rollback()
+        # กันกรณี race แล้วมี OPEN โผล่มาอีกครั้ง
         open_row = _get_open_with_customer(db)
         if open_row:
             return PurchaseOut(
