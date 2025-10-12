@@ -33,15 +33,10 @@ def _try_open(idx: int) -> Optional[cv2.VideoCapture]:
     return None
 
 def _open_cam(device_index: int) -> Optional[cv2.VideoCapture]:
-    # device_index >= 0 = บังคับใช้ index นั้น
-    if device_index >= 0:
-        return _try_open(device_index)
-    # device_index == -1 = auto-scan
-    for idx in range(SCAN_MAX + 1):
-        cap = _try_open(idx)
-        if cap is not None:
-            return cap
-    return None
+    # manual-only: ต้องเป็น index >= 0 เท่านั้น
+    if device_index < 0:
+        return None
+    return _try_open(device_index)
 
 def _configure_cap(cap: cv2.VideoCapture, width: int, height: int, fps: int):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(width))
@@ -116,19 +111,10 @@ def devices(width: int = Query(640, ge=160, le=3840),
             except Exception: pass
     return {"devices": found, "scan_max": SCAN_MAX}
 
-@router.get("/auto-index")
-def auto_index(width: int = Query(1280, ge=160, le=3840),
-               height: int = Query(720, ge=120, le=2160),
-               fps: int = Query(DEFAULT_FPS, ge=1, le=60),
-               warmup: int = Query(DEFAULT_WARMUP, ge=0, le=30)):
-    idx = _first_working_index(width, height, fps, warmup)
-    if idx is None:
-        raise HTTPException(status_code=404, detail="No working camera found")
-    return {"index": idx}
 
 @router.post("/capture", response_class=Response)
 def capture(
-    device_index: int = Query(0, description=">=0 = ใช้กล้องนั้น, -1 = auto"),
+    device_index: int = Query(0, ge=0, description="เลือก index กล้องเอง (0,1,2,...)"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720, ge=120, le=2160),
     warmup: int = Query(DEFAULT_WARMUP, ge=0, le=30),
@@ -136,7 +122,7 @@ def capture(
 ):
     cap = _open_cam(device_index)
     if cap is None:
-        raise HTTPException(status_code=500, detail=f"Cannot open camera (index={device_index})")
+        raise HTTPException(status_code=400, detail=f"Invalid camera index: {device_index}")
 
     _configure_cap(cap, width, height, fps)
     _warmup(cap, warmup)
@@ -155,7 +141,7 @@ def capture(
 
 @router.get("/preview")
 def preview(
-    device_index: int = Query(0, description=">=0 = ใช้กล้องนั้น, -1 = auto"),
+    device_index: int = Query(0, ge=0, description="เลือก index กล้องเอง (0,1,2,...)"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720, ge=120, le=2160),
     warmup: int = Query(DEFAULT_WARMUP, ge=0, le=60),
@@ -164,7 +150,7 @@ def preview(
 ):
     cap = _open_cam(device_index)
     if cap is None:
-        raise HTTPException(status_code=500, detail=f"Cannot open camera (index={device_index})")
+        raise HTTPException(status_code=400, detail=f"Invalid camera index: {device_index}")
 
     _configure_cap(cap, width, height, fps)
     _warmup(cap, warmup)
@@ -210,14 +196,16 @@ def preview(
     )
 
 @router.get("/status")
-def camera_status(device_index: int = Query(0, description=">=0 = ใช้กล้องนั้น, -1 = auto"),
-                  width: int = Query(640, ge=160, le=3840),
-                  height: int = Query(360, ge=120, le=2160),
-                  fps: int = Query(DEFAULT_FPS, ge=1, le=60),
-                  warmup: int = Query(2, ge=0, le=30)):
+def camera_status(
+    device_index: int = Query(0, ge=0, description="เลือก index กล้องเอง (0,1,2,...)"),
+    width: int = Query(640, ge=160, le=3840),
+    height: int = Query(360, ge=120, le=2160),
+    fps: int = Query(DEFAULT_FPS, ge=1, le=60),
+    warmup: int = Query(2, ge=0, le=30),
+):
     cap = _open_cam(device_index)
     if cap is None:
-        return {"status": "disconnected", "message": f"เปิดไม่ได้ index={device_index}"}
+        return {"status": "disconnected", "message": f"invalid index={device_index}"}
     try:
         _configure_cap(cap, width, height, fps)
         _warmup(cap, warmup)

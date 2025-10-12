@@ -9,8 +9,6 @@ from app.database import SessionLocal
 import os, uuid, shutil
 import requests
 from pathlib import Path
-import re
-
 
 router = APIRouter(prefix="/purchases", tags=["purchase_items"])
 
@@ -22,9 +20,6 @@ os.makedirs(ITEM_DIR, exist_ok=True)
 HARDWARE_URL = os.getenv("HARDWARE_URL", "http://host.docker.internal:9000")
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
-ENV_CAMERA_INDEX = os.getenv("CAMERA_DEVICE_INDEX")  # เช่น "1"
-ENV_CAMERA_NAME_REGEX = os.getenv("CAMERA_NAME_REGEX")  # เช่น ".*(USB|Logitech|UVC).*"
-
 # ---------- DB Session ----------
 def get_db():
     db = SessionLocal()
@@ -32,63 +27,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-def _list_cameras_from_hardware() -> list[dict]:
-    try:
-        r = requests.get(f"{HARDWARE_URL}/camera/devices", timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        # เผื่อบาง service ห่อใน key
-        if isinstance(data, dict) and "devices" in data and isinstance(data["devices"], list):
-            return data["devices"]
-    except requests.RequestException:
-        pass
-    return []
-
-def _pick_usb_camera_index(camera_name_regex: str | None = None) -> int | None:
-    """
-    เลือก index ของกล้อง USB ตามกติกา:
-      1) ถ้ามี ENV_CAMERA_INDEX ให้ใช้ทันที
-      2) หากมีรายการอุปกรณ์จาก /camera/devices:
-         2.1) ถ้ามี regex ให้เลือกตัวที่ชื่อ match ก่อน
-         2.2) มิฉะนั้น เลือกตัวที่ transport == 'usb' หรือ name/path บอกใบ้ว่าเป็น USB/UVC
-      3) ถ้าเลือกไม่ได้ คืน None
-    """
-    # 1) บังคับจาก ENV
-    if ENV_CAMERA_INDEX:
-        try:
-            return int(ENV_CAMERA_INDEX)
-        except ValueError:
-            pass
-
-    # 2) หาอุปกรณ์จริงจาก hardware_service
-    devices = _list_cameras_from_hardware()
-    if not devices:
-        return None
-
-    # ใช้ regex จาก env ถ้าไม่ส่งมากับฟังก์ชัน
-    if camera_name_regex is None:
-        camera_name_regex = ENV_CAMERA_NAME_REGEX
-
-    pat = re.compile(camera_name_regex, re.IGNORECASE) if camera_name_regex else None
-
-    # 2.1) เลือกจาก regex ก่อน
-    if pat:
-        for d in devices:
-            name = f"{d.get('name','')} {d.get('path','')}"
-            if pat.search(name):
-                return int(d.get("index", 0))
-
-    # 2.2) เลือกตัวที่บอกใบ้ว่าเป็น USB
-    for d in devices:
-        transport = (d.get("transport") or "").lower()
-        name = f"{d.get('name','')} {d.get('path','')}".lower()
-        if transport == "usb" or "usb" in name or "uvc" in name:
-            return int(d.get("index", 0))
-
-    return None        
 
 # ---------- Guards ----------
 def ensure_open(db: Session, purchase_id: int):
@@ -215,8 +153,6 @@ def list_purchase_products(
     out: List[ProductOut] = []
     for r in rows:
         d = dict(r)
-
-        # ถ้าใน DB เก็บเป็นแค่ไฟล์เนม ให้เติม prefix เป็น /uploads/products/ ให้หน้าเว็บโหลดได้
         img = d.get("prod_img")
         if img:
             if img.startswith("/uploads/"):
@@ -224,11 +160,9 @@ def list_purchase_products(
             else:
                 d["prod_img"] = f"/uploads/products/{img}"
         else:
-            d["prod_img"] = None  # หรือจะใส่ placeholder ก็ได้
-
+            d["prod_img"] = None
         out.append(ProductOut(**d))
     return out
-
 
 # ---------- 1) ดูรายการของบิล ----------
 @router.get("/{purchase_id}/items", response_model=List[ItemOut])
@@ -260,7 +194,7 @@ def items_summary(purchase_id: int, db: Session = Depends(get_db)):
     """), {"pid": purchase_id}).mappings().first()
     return row
 
-# ---------- 3) เพิ่มรายการ (บังคับถ่ายรูปเสมอ) ----------
+# ---------- 3) เพิ่มรายการ (บังคับถ่ายรูปเสมอ — เลือกกล้องเองเท่านั้น) ----------
 @router.post("/{purchase_id}/items", response_model=ItemOut, status_code=201)
 def add_item(
     purchase_id: int,
@@ -269,21 +203,13 @@ def add_item(
         "half_up", pattern="^(half_up|up|down)$",
         description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"
     ),
-    # เปลี่ยน default เป็น -1 และอนุญาต ge=-1
     device_index: int = Query(
-        -1, ge=-1,
-        description="index กล้องที่ผู้ใช้เลือก (-1 = ให้ระบบเลือกอัตโนมัติ)"
+        0, ge=0,
+        description="**ต้องเลือกกล้องเอง** (index 0,1,2,...)"
     ),
     warmup: int = Query(8, ge=0, le=30, description="วอร์มกล้อง"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720,  ge=120, le=2160),
-
-    auto_pick_usb: bool = Query(True, description="พยายามเลือกกล้อง USB อัตโนมัติเมื่อ device_index=-1"),
-    camera_name_regex: Optional[str] = Query(
-        None,
-        description="regex สำหรับชื่อ/พาธกล้อง เช่น '.*(Logitech|USB).*'"
-    ),
-
     db: Session = Depends(get_db),
 ):
     ensure_open(db, purchase_id)
@@ -296,27 +222,12 @@ def add_item(
     if not prod:
         raise HTTPException(status_code=400, detail="Product not found")
 
-    # 2) เลือกกล้อง (priority: ค่าที่ผู้ใช้เลือกมาก่อน)
-    if device_index >= 0:
-        chosen_index = device_index
-    else:
-        if auto_pick_usb:
-            chosen_index = _pick_usb_camera_index(camera_name_regex=camera_name_regex)
-            if chosen_index is None:
-                chosen_index = -1  # ให้ hardware_service auto
-        else:
-            # ใช้ ENV_CAMERA_INDEX ถ้ามี ไม่งั้น fallback เป็น 0
-            try:
-                chosen_index = int(ENV_CAMERA_INDEX) if ENV_CAMERA_INDEX is not None else 0
-            except ValueError:
-                chosen_index = 0
-
-    # 3) ถ่ายภาพจาก hardware_service
+    # 2) ถ่ายภาพจาก hardware_service ด้วยกล้องที่ผู้ใช้เลือกเท่านั้น
     try:
         r = requests.post(
             f"{HARDWARE_URL}/camera/capture",
             params={
-                "device_index": chosen_index,   # อาจเป็นค่าที่ผู้ใช้เลือก หรือ -1 เพื่อ auto
+                "device_index": device_index,   # ใช้ตามที่ผู้ใช้ระบุ
                 "warmup": warmup,
                 "width": width,
                 "height": height,
@@ -335,11 +246,11 @@ def add_item(
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Hardware unreachable: {e}")
 
-    # 4) คำนวณราคา + ปัดตามโหมด
+    # 3) คำนวณราคา + ปัดตามโหมด
     raw_price = body.weight * prod["prod_price"]
     total_price = _round_money(Decimal(raw_price), round_mode)
 
-    # 5) บันทึกรายการ
+    # 4) บันทึกรายการ
     item = db.execute(text("""
         INSERT INTO purchase_items (purchase_id, prod_id, weight, price)
         VALUES (:pid, :prod, :w, :p)
@@ -347,7 +258,7 @@ def add_item(
     """), {"pid": purchase_id, "prod": body.prod_id, "w": body.weight, "p": total_price}
     ).mappings().first()
 
-    # 6) บันทึกรูป (บังคับอย่างน้อย 1 รูป)
+    # 5) บันทึกรูป (บังคับอย่างน้อย 1 รูป)
     fname = f"{uuid.uuid4().hex}.jpg"
     abs_path = os.path.join(ITEM_DIR, fname)
     with open(abs_path, "wb") as f:
@@ -366,8 +277,6 @@ def add_item(
         prod_name=prod["prod_name"],
         photos=[PhotoOut(photo_id=photo["photo_id"], img_path=photo["img_path"])]
     )
-
-
 
 # ---------- 5) แก้ไข "ราคา" เท่านั้น (มีโหมดปัดราคา) ----------
 @router.put("/{purchase_id}/items/{item_id}", response_model=ItemOut)
@@ -440,5 +349,3 @@ def delete_purchase_item(
             pass
 
     return Response(status_code=204)
-
-
