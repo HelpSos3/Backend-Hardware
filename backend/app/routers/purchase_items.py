@@ -53,10 +53,36 @@ ROUND_MAP = {
     "up": ROUND_UP,
     "down": ROUND_DOWN,
 }
-def _round_money(value: Decimal, mode: str) -> Decimal:
-    r = ROUND_MAP.get(mode, ROUND_HALF_UP)
-    return value.quantize(Decimal("0.01"), rounding=r)
 
+def _round_money_step_2dp(
+    value: Decimal,
+    mode: str = "half_up",          # 'half_up' | 'up' | 'down' | 'none'
+    step: Decimal | None = None,    # เช่น 0.25 / 0.50 / 1.00; None = ไม่ใช้ขั้น
+) -> Decimal:
+    """
+    ลอจิก:
+      - mode == 'none' : ไม่ปัด → 'ตัด' ให้เหลือ 2 ตำแหน่ง (กัน DB ปัดเอง) แล้วจบ
+      - mode != 'none' : (1) ถ้ามี step ให้ปัดเข้า step ก่อน ด้วยโหมดที่เลือก
+                         (2) จากนั้นบังคับ 2 ตำแหน่งตามโหมดเดียวกัน
+    """
+    v = Decimal(value)
+
+    # ไม่ปัด: เก็บตามจริง แต่ตัดให้เหลือ 2 ตำแหน่ง (DECIMAL(10,2) ใน DB)
+    if mode == "none":
+        return v.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+    r = ROUND_MAP.get(mode, ROUND_HALF_UP)
+
+    if step is not None:
+        step = Decimal(step)
+        if step <= 0:
+            raise HTTPException(status_code=400, detail="round_step ต้องมากกว่า 0")
+        # ต้องเป็นเท่าของ 0.01 (สตางค์)
+        if (step * 100) != (step * 100).to_integral_value():
+            raise HTTPException(status_code=400, detail="round_step ต้องเป็นเท่าของ 0.01 (เช่น 0.25, 0.50, 1.00)")
+        # ปัดเข้า step
+        v = (v / step).quantize(Decimal("1"), rounding=r) * step
+        return v.quantize(Decimal("0.01"), rounding=r)
 # ---------- Schemas ----------
 class PhotoOut(BaseModel):
     photo_id: int
@@ -200,13 +226,15 @@ def add_item(
     purchase_id: int,
     body: ItemCreate,
     round_mode: str = Query(
-        "half_up", pattern="^(half_up|up|down)$",
-        description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"
+        "half_up",
+        pattern="^(half_up|up|down|none)$",
+        description="โหมดปัดราคา: half_up|up|down|none (เริ่มต้น: half_up)"
     ),
-    device_index: int = Query(
-        0, ge=0,
-        description="**ต้องเลือกกล้องเอง** (index 0,1,2,...)"
+    round_step: Optional[Decimal] = Query(
+        None,
+        description="ช่วงปัด (step) เช่น 0.25, 0.50, 1.00; ว่าง = ไม่ใช้ขั้น"
     ),
+    device_index: int = Query(0, ge=0, description="**ต้องเลือกกล้องเอง** (index 0,1,2,...)"),
     warmup: int = Query(8, ge=0, le=30, description="วอร์มกล้อง"),
     width: int = Query(1280, ge=160, le=3840),
     height: int = Query(720,  ge=120, le=2160),
@@ -246,9 +274,13 @@ def add_item(
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Hardware unreachable: {e}")
 
-    # 3) คำนวณราคา + ปัดตามโหมด
-    raw_price = body.weight * prod["prod_price"]
-    total_price = _round_money(Decimal(raw_price), round_mode)
+    # 3) คำนวณราคา → ปัดตาม step (ถ้ามี) → คง 2 ตำแหน่งเสมอ
+    raw_price = Decimal(body.weight) * Decimal(prod["prod_price"])
+    total_price = _round_money_step_2dp(
+        raw_price,
+        mode=round_mode,
+        step=round_step,
+    )
 
     # 4) บันทึกรายการ
     item = db.execute(text("""
@@ -284,8 +316,15 @@ def update_item_price_only(
     purchase_id: int,
     item_id: int,
     body: ItemUpdatePrice,
-    round_mode: str = Query("half_up", pattern="^(half_up|up|down)$",
-                            description="โหมดปัดราคา: half_up|up|down (เริ่มต้น: half_up)"),
+    round_mode: str = Query(
+        "half_up",
+        pattern="^(half_up|up|down|none)$",
+        description="โหมดปัดราคา: half_up|up|down|none (เริ่มต้น: half_up)"
+    ),
+    round_step: Optional[Decimal] = Query(
+        None,
+        description="ช่วงปัด (step) เช่น 0.25, 0.50, 1.00; ว่าง = ไม่ใช้ขั้น"
+    ),
     db: Session = Depends(get_db),
 ):
     ensure_open(db, purchase_id)
@@ -299,7 +338,11 @@ def update_item_price_only(
     if not cur:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    new_price = _round_money(body.price, round_mode)
+    new_price = _round_money_step_2dp(
+        Decimal(body.price),
+        mode=round_mode,
+        step=round_step,
+    )
 
     row = db.execute(text("""
         UPDATE purchase_items
