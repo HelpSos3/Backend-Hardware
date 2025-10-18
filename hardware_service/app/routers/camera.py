@@ -310,14 +310,14 @@ def _require_token(x_token: Optional[str] = Header(default=None, alias="X-Token"
     if x_token != FIXED_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@router.get("/live", include_in_schema=False)
+@router.get("/live")
 def live(_: None = Depends(_require_token)):
     qs = _qs({"device_index": FIXED_INDEX, "backend": FIXED_PREVIEW_BACK, "codec": FIXED_PREVIEW_CODEC,
               "width": FIXED_PREVIEW_W, "height": FIXED_PREVIEW_H, "fps": FIXED_PREVIEW_FPS,
               "warmup": FIXED_PREVIEW_WARMUP, "fps_strategy": FIXED_PREVIEW_STRAT})
     return RedirectResponse(url=f"/camera/preview?{qs}", status_code=302)
 
-@router.get("/live_page", response_class=HTMLResponse, include_in_schema=False)
+@router.get("/live_page", response_class=HTMLResponse)
 def live_page(_: None = Depends(_require_token)):
     html = """
     <html><head><meta http-equiv="Cache-Control" content="no-store" /></head>
@@ -327,7 +327,7 @@ def live_page(_: None = Depends(_require_token)):
     </body></html>"""
     return HTMLResponse(content=html, headers={"Cache-Control": "no-store"})
 
-@router.api_route("/snap", methods=["GET", "POST"], include_in_schema=False)
+@router.api_route("/snap", methods=["GET", "POST"])
 def snap(_: None = Depends(_require_token)):
     """
     ถ่ายรูปนิ่งด้วยโปรไฟล์คงที่
@@ -346,7 +346,7 @@ def snap(_: None = Depends(_require_token)):
         fps_strategy=FIXED_SNAP_STRAT,
     )
 
-@router.get("/health", include_in_schema=False)
+@router.get("/health")
 def health(_: None = Depends(_require_token)):
     qs = _qs({
         "device_index": FIXED_INDEX,
