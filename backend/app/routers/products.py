@@ -282,28 +282,7 @@ async def patch_product(
     result["category_name"] = cat["category_name"] if cat else None
     return result
 
-# ====== DELETE ======
-@router.delete("/{prod_id}", status_code=204)
-def delete_product(prod_id: int, db: Session = Depends(get_db)):
-    # ลบรูปเก่าก่อนลบแถว
-    current = db.execute(
-        text("SELECT prod_img FROM product WHERE prod_id = :pid"),
-        {"pid": prod_id},
-    ).mappings().first()
 
-    res = db.execute(
-        text("DELETE FROM product WHERE prod_id = :pid"),
-        {"pid": prod_id},
-    )
-    db.commit()
-    if res.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    # ลบไฟล์รูปในดิสก์ (ถ้ามี)
-    if current and current["prod_img"]:
-        delete_image(current["prod_img"])
-
-    return Response(status_code=204)
 
 @router.get("/by-category/{category_id}", response_model=List[ProductOut])
 def list_products_by_category(category_id: int, db: Session = Depends(get_db)):

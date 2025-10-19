@@ -11,7 +11,7 @@ from app.database import SessionLocal
 import os, uuid, requests, base64
 import math
 from pathlib import Path
-
+import tempfile  
 
 router = APIRouter(prefix="/purchases", tags=["purchases"])
 
@@ -153,16 +153,35 @@ def _upsert_customer_by_idcard(db: Session, full_name: str, national_id: str, ad
 def _save_idcard_photo_if_present(db: Session, customer_id: int, photo_b64: str | None) -> str | None:
     if not photo_b64:
         return None
+    try:
+        img_bytes = base64.b64decode(photo_b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="photo_base64 ไม่ถูกต้อง")
+
+    target_dir = Path(UPLOAD_ROOT) / "idcard_photos"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
     fname = f"{uuid.uuid4().hex}.jpg"
     rel_path = f"idcard_photos/{fname}"
-    abs_path = os.path.join(UPLOAD_ROOT, rel_path)
-    with open(abs_path, "wb") as f:
-        f.write(base64.b64decode(photo_b64))
+    abs_path = target_dir / fname
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target_dir, delete=False) as tmp:
+            tmp.write(img_bytes)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, abs_path)
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
     db.execute(
-        text("""
-            INSERT INTO customer_photos (customer_id, photo_path)
-            VALUES (:cid, :p)
-        """),
+        text("INSERT INTO customer_photos (customer_id, photo_path) VALUES (:cid, :p)"),
         {"cid": customer_id, "p": f"/uploads/{rel_path}"}
     )
     return f"/uploads/{rel_path}"
@@ -181,26 +200,23 @@ def get_open_purchase(db: Session = Depends(get_db)):
 
 
 @router.post("/quick-open/idcard/preview", response_model=IdCardPreviewOut)
-def idcard_preview(
-    reader_index: int = Query(0),
-    with_photo: int = Query(1),
-):
+def idcard_preview(reader_index: int = Query(0), with_photo: int = Query(1)):
     try:
-        r = requests.get(
-            f"{HARDWARE_URL}/idcard/scan",
-            params={"reader_index": reader_index, "with_photo": with_photo},
-            timeout=30,
-        )
+        with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+            r = client.get(
+                f"{HARDWARE_URL}/idcard/scan",
+                params={"reader_index": reader_index, "with_photo": with_photo},
+            )
         r.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"hardware error: {e}")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"hardware error: {e}")  # 502 เหมาะกับ upstream ล้ม
 
-    p = r.json()  # { full_name, national_id, address, photo_base64? }
+    p = r.json()
     return IdCardPreviewOut(
         full_name=p.get("full_name"),
         national_id=p.get("national_id"),
         address=p.get("address"),
-        photo_base64=p.get("photo_base64")
+        photo_base64=p.get("photo_base64"),
     )
 
 @router.post("/quick-open/idcard/commit", response_model=PurchaseOut, status_code=201)
@@ -382,21 +398,39 @@ def quick_open_existing(
 
 @router.post("/quick-open/anonymous/preview", response_model=PreviewPhotoOut)
 def quick_open_anonymous_preview(
-    device_index: int = Query(0),
+    device_index: int = Query(0, ge=0),
     warmup: int = Query(8, ge=0, le=30),
 ):
-    # เรียก hardware_service เพื่อถ่ายภาพ
     try:
-        r = requests.post(
-            f"{HARDWARE_URL}/camera/capture",
-            params={"device_index": device_index, "warmup": warmup},
-            timeout=15,
-        )
-        r.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Hardware error: {e}")
+        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+            # ทางหลัก: GET /camera/snap
+            resp = client.get(
+                f"{HARDWARE_URL}/camera/snap",
+                params={"device_index": device_index, "warmup": warmup},
+                headers={"Accept": "image/jpeg"},
+            )
 
-    b64 = base64.b64encode(r.content).decode("ascii")
+            if resp.status_code in (404, 405):  # ไม่เจอหรือ method ไม่รองรับ → fallback
+                resp = client.post(
+                    f"{HARDWARE_URL}/camera/capture",
+                    params={"device_index": device_index, "warmup": warmup},
+                )
+
+            resp.raise_for_status()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "image" not in ct:
+                raise HTTPException(status_code=502, detail=f"unexpected content-type from hardware: {ct}")
+
+            img_bytes = resp.content
+
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=502, detail=f"hardware connect error: {e}")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="hardware read timeout")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"hardware error: {e}")
+
+    b64 = base64.b64encode(img_bytes).decode("ascii")
     return PreviewPhotoOut(photo_base64=b64)
 
 @router.post("/quick-open/anonymous/commit", response_model=PurchaseOut, status_code=201)
@@ -433,20 +467,33 @@ def quick_open_anonymous_commit(
         if payload.on_open == "error":
             raise HTTPException(status_code=409, detail="มีบิลค้างอยู่")
 
-    # 1) บันทึกรูปจาก base64 ลงไฟล์
+   # 1) บันทึกรูปจาก base64 ลงไฟล์ (atomic)
     try:
         img_bytes = base64.b64decode(payload.photo_base64, validate=True)
     except Exception:
         raise HTTPException(status_code=400, detail="photo_base64 ไม่ถูกต้อง")
 
+    target_dir = Path(UPLOAD_ROOT) / "customer_photos"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
     fname = f"{uuid.uuid4().hex}.jpg"
     rel_path = f"customer_photos/{fname}"
-    abs_path = os.path.join(UPLOAD_ROOT, rel_path)
+    abs_path = target_dir / fname
+
+    tmp_path = None
     try:
-        with open(abs_path, "wb") as f:
-            f.write(img_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ไม่สามารถบันทึกรูปภาพได้: {e}")
+        with tempfile.NamedTemporaryFile(dir=target_dir, delete=False) as tmp:
+            tmp.write(img_bytes)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, abs_path)  # atomic move
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
     # 2) ลูกค้า anonymous
     row_cust = db.execute(text(

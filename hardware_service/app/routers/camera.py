@@ -134,6 +134,39 @@ def _mean_brightness(frame):
     small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
     return float(np.mean(small))
 
+def _try_open_idx(idx: int) -> bool:
+    cap = _try_open(idx)
+    if cap is None:
+        return False
+    try: cap.release()
+    except Exception: pass
+    return True
+
+def _pick_index_for_snap() -> int:
+    """
+    เลือกกล้องสำหรับ SNAP:
+      1) พยายามใช้ FIXED_INDEX ก่อน
+      2) ถ้าไม่ได้ ให้เลือก index ที่ 'สูงสุด' ที่เปิดได้ (คาดว่าเป็น USB)
+      3) ถ้ายังไม่ได้ ให้เลือก index ที่ 'ต่ำสุด' ที่เปิดได้
+      4) ถ้าไม่มีเลย -> raise 400
+    """
+    # 1) FIXED_INDEX ก่อน
+    if 0 <= FIXED_INDEX <= SCAN_MAX and _try_open_idx(FIXED_INDEX):
+        return FIXED_INDEX
+
+    # 2) สแกนจากบนลงล่าง -> หาค่า "สูงสุด" ที่เปิดได้ (ชอบ USB)
+    for idx in range(SCAN_MAX, -1, -1):
+        if _try_open_idx(idx):
+            return idx
+
+    # (สำรอง) 3) ล่างขึ้นบน
+    for idx in range(0, SCAN_MAX + 1):
+        if _try_open_idx(idx):
+            return idx
+
+    # 4) ไม่เจอกล้องเลย
+    raise HTTPException(status_code=400, detail="No available camera device")
+
 # ===== Routes =====
 @router.get("/ping", response_class=PlainTextResponse)
 def ping():
@@ -312,9 +345,14 @@ def _require_token(x_token: Optional[str] = Header(default=None, alias="X-Token"
 
 @router.get("/live")
 def live(_: None = Depends(_require_token)):
-    qs = _qs({"device_index": FIXED_INDEX, "backend": FIXED_PREVIEW_BACK, "codec": FIXED_PREVIEW_CODEC,
-              "width": FIXED_PREVIEW_W, "height": FIXED_PREVIEW_H, "fps": FIXED_PREVIEW_FPS,
-              "warmup": FIXED_PREVIEW_WARMUP, "fps_strategy": FIXED_PREVIEW_STRAT})
+    chosen_idx = _pick_index_for_snap()
+    qs = _qs({
+        "device_index": chosen_idx,
+        "backend": FIXED_PREVIEW_BACK, "codec": FIXED_PREVIEW_CODEC,
+        "width": FIXED_PREVIEW_W, "height": FIXED_PREVIEW_H,
+        "fps": FIXED_PREVIEW_FPS, "warmup": FIXED_PREVIEW_WARMUP,
+        "fps_strategy": FIXED_PREVIEW_STRAT
+    })
     return RedirectResponse(url=f"/camera/preview?{qs}", status_code=302)
 
 @router.get("/live_page", response_class=HTMLResponse)
@@ -330,12 +368,20 @@ def live_page(_: None = Depends(_require_token)):
 @router.api_route("/snap", methods=["GET", "POST"])
 def snap(_: None = Depends(_require_token)):
     """
-    ถ่ายรูปนิ่งด้วยโปรไฟล์คงที่
-    - รองรับทั้ง GET (เปิดผ่านเบราว์เซอร์) และ POST (ระบบเรียกเก็บไฟล์)
-    - เรียก capture() โดยตรง เพื่อคืน image/jpeg ทันที
+    ถ่ายรูปนิ่งด้วยโปรไฟล์คงที่ (ไม่มี X-Token ก็ได้ ถ้าไม่ได้ตั้ง FIXED_TOKEN)
+    ตอนนี้จะเลือก index ตาม _pick_index_for_snap() เพื่อ 'ชอบ USB' และ fallback อัตโนมัติ
     """
+    try:
+        chosen_idx = _pick_index_for_snap()
+    except HTTPException as e:
+        # ส่งต่อ error
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Pick camera index failed: {e}")
+
+    # ใช้พารามิเตอร์คงที่ของ SNAP แต่แทน device_index ด้วย chosen_idx
     return capture(
-        device_index=FIXED_INDEX,
+        device_index=chosen_idx,
         width=FIXED_SNAP_W,
         height=FIXED_SNAP_H,
         warmup=FIXED_SNAP_WARMUP,
@@ -348,14 +394,12 @@ def snap(_: None = Depends(_require_token)):
 
 @router.get("/health")
 def health(_: None = Depends(_require_token)):
+    chosen_idx = _pick_index_for_snap()
     qs = _qs({
-        "device_index": FIXED_INDEX,
-        "backend": FIXED_STATUS_BACK,
-        "codec": FIXED_STATUS_CODEC,
-        "width": FIXED_STATUS_W,
-        "height": FIXED_STATUS_H,
-        "fps": FIXED_STATUS_FPS,
-        "warmup": FIXED_STATUS_WARMUP,
-        "fps_strategy": FIXED_STATUS_STRAT,
+        "device_index": chosen_idx,
+        "backend": FIXED_STATUS_BACK, "codec": FIXED_STATUS_CODEC,
+        "width": FIXED_STATUS_W, "height": FIXED_STATUS_H,
+        "fps": FIXED_STATUS_FPS, "warmup": FIXED_STATUS_WARMUP,
+        "fps_strategy": FIXED_STATUS_STRAT
     })
     return RedirectResponse(url=f"/camera/status?{qs}", status_code=302)

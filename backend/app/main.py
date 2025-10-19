@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from .models import create_tables
 from .routers import products, categories
 from .routers import purchases, purchase_items, payments
-from .routers import hardware_proxy
+from .routers import hardware_proxy, camera_proxy  
 
 app = FastAPI(title="Scrap Shop Backend")
 
@@ -49,6 +49,8 @@ app.include_router(products.router)
 app.include_router(purchases.router)
 app.include_router(purchase_items.router)
 app.include_router(payments.router)
+
+app.include_router(camera_proxy.router)
 
 
 
