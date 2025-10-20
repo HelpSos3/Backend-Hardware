@@ -167,6 +167,16 @@ def _pick_index_for_snap() -> int:
     # 4) ไม่เจอกล้องเลย
     raise HTTPException(status_code=400, detail="No available camera device")
 
+def _backend_name(be: int) -> str:
+    return (
+        "dshow"        if be == getattr(cv2, "CAP_DSHOW", -1) else
+        "msmf"         if be == getattr(cv2, "CAP_MSMF", -1) else
+        "v4l2"         if be == getattr(cv2, "CAP_V4L2", -1) else
+        "avfoundation" if be == getattr(cv2, "CAP_AVFOUNDATION", -1) else
+        "auto" if be == 0 else str(be)
+    )
+    
+
 # ===== Routes =====
 @router.get("/ping", response_class=PlainTextResponse)
 def ping():
@@ -403,3 +413,70 @@ def health(_: None = Depends(_require_token)):
         "fps_strategy": FIXED_STATUS_STRAT
     })
     return RedirectResponse(url=f"/camera/status?{qs}", status_code=302)
+
+
+@router.get("/devices")
+def list_devices(
+    include_closed: bool = Query(False, description="ถ้า true จะแสดง index ทั้งหมดแม้เปิดไม่ได้"),
+    quick: bool = Query(True, description="เปิดแบบเร็ว: แค่เช็คเปิดได้และอ่าน meta เบื้องต้น"),
+    try_config: bool = Query(False, description="ลอง set W/H/FPS คร่าว ๆ เพื่อลองเจรจา format"),
+    probe_width: int = Query(640, ge=1),
+    probe_height: int = Query(480, ge=1),
+    probe_fps: int = Query(15, ge=1),
+):
+    devices = []
+    platform_backends = _backends_for_platform()
+
+    for idx in range(0, SCAN_MAX + 1):
+        opened = False
+        opened_backend = None
+        width = height = None
+        fps = None
+
+        for be in platform_backends:
+            cap = cv2.VideoCapture(idx, be)
+            if cap is not None and cap.isOpened():
+                opened = True
+                opened_backend = _backend_name(be)
+
+                # ปรับแบบเร็ว (option) เพื่อกันค้าง
+                if try_config:
+                    try:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(probe_width))
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(probe_height))
+                        cap.set(cv2.CAP_PROP_FPS,          float(probe_fps))
+                        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+
+                # อ่าน meta ที่กล้องรายงาน
+                try:
+                    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    fps    = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                except Exception:
+                    pass
+
+                try: cap.release()
+                except Exception: pass
+                break  # เปิดได้แล้ว ไม่ต้องลอง backend ต่อ
+            try: cap.release()
+            except Exception: pass
+
+        item = {
+            "index": idx,
+            "opened": opened,
+            "backend": opened_backend,  # อาจเป็น None ถ้าเปิดไม่ได้
+            "width": width,
+            "height": height,
+            "fps": fps,
+        }
+        if opened or include_closed:
+            devices.append(item)
+
+    return {
+        "scan_max": SCAN_MAX,
+        "os_backends": [_backend_name(b) for b in platform_backends],
+        "devices": devices
+    }
