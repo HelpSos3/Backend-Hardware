@@ -41,8 +41,6 @@ def _ensure_open(db: Session, purchase_id: int):
         raise HTTPException(status_code=409, detail="Purchase is not OPEN")
 
 def _calc_summary(db: Session, purchase_id: int) -> Tuple[Decimal, Decimal]:
-    # NOTE: จากสคีมาของคุณ: purchase_items.weight, purchase_items.price
-    # ในระบบจริง price มักเป็น 'amount (ราคารวมต่อแถว)' จึง SUM(price) = total_amount
     row = db.execute(text("""
         SELECT
           COALESCE(SUM(weight), 0) AS total_weight,

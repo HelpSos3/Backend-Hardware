@@ -6,12 +6,11 @@ from typing import Optional, List , Annotated
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database import SessionLocal
-import os, uuid, shutil
-import requests
+import os, uuid, base64, tempfile, httpx
 from pathlib import Path
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
-
+import shutil
 router = APIRouter(prefix="/purchases", tags=["purchase_items"])
 
 # ---------- CONFIG ----------
@@ -109,6 +108,10 @@ class ItemOut(BaseModel):
     price: Dec
     prod_name: Optional[str] = None
     photos: List[PhotoOut] = Field(default_factory=list)
+
+# ===== Models (ตัวอย่างย่อ ถ้ามีอยู่แล้วใช้ของเดิมได้) =====
+class PreviewPhotoOut(BaseModel):
+    photo_base64: str
 
 class ItemCreate(BaseModel):
     prod_id: int
@@ -235,27 +238,78 @@ def items_summary(purchase_id: int, db: Session = Depends(get_db)):
     return JSONResponse(content=jsonable_encoder(dict(row), custom_encoder={Decimal: str}))
 
 
-@router.post("/{purchase_id}/items", response_model=ItemOut, status_code=201)
-def add_item(
+@router.post("/{purchase_id}/items/preview", response_model=PreviewPhotoOut, status_code=200)
+def preview_item_photo(
     purchase_id: int,
-    body: ItemCreate,
+    device_index: int = Query(0, ge=0),
+    warmup: int = Query(3, ge=0, le=30),
+    backend: Optional[str] = Query(None, description="camera backend (auto|dshow|msmf|v4l2|avfoundation)"),
+):
+    # ยิง hardware_service → /camera/capture
+    params = {
+        "device_index": device_index,
+        "warmup": warmup,
+        "width": 1280,     # ใช้ดีฟอลต์ตามที่คุณกำหนดไว้
+        "height": 720,
+        "fps": 15,
+        "codec": "MJPG",
+        "fps_strategy": "auto",
+    }
+    if backend:
+        params["backend"] = backend
+
+    try:
+        with httpx.Client(timeout=httpx.Timeout(20.0)) as client:
+            resp = client.post(f"{HARDWARE_URL}/camera/capture", params=params)
+            resp.raise_for_status()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "image" not in ct:
+                raise HTTPException(status_code=502, detail=f"unexpected content-type from hardware: {ct}")
+            img_bytes = resp.content
+            if not img_bytes:
+                raise HTTPException(status_code=502, detail="No image data from hardware")
+    except httpx.ConnectError as e:
+        raise HTTPException(status_code=502, detail=f"hardware connect error: {e}")
+    except httpx.ReadTimeout:
+        raise HTTPException(status_code=504, detail="hardware read timeout")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"hardware error: {e}")
+
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    return PreviewPhotoOut(photo_base64=b64)
+
+
+# ============ 2) COMMIT: บันทึกรูป + insert item + insert photo ============
+class CommitItemIn(BaseModel):
+    prod_id: int
+    weight: Decimal
+    photo_base64: str
+
+@router.post("/{purchase_id}/items/commit", status_code=201)
+def commit_item_with_photo(
+    purchase_id: int,
+    body: CommitItemIn,
     round_mode: str = Query(
         "half_up",
         pattern="^(half_up|up|down|none)$",
         description="โหมดปัดราคา: half_up|up|down|none (เริ่มต้น: half_up)"
     ),
-    round_step: Optional[Dec] = Query(
-        None,
-        description="ช่วงปัด (step) เช่น 0.25, 0.50, 1.00; ว่าง = ไม่ใช้ขั้น"
+    round_step: Optional[Decimal] = Query(
+        None, description="ช่วงปัด (step) เช่น 0.25, 0.50, 1.00; ว่าง = ไม่ใช้ขั้น"
     ),
-    # อนุญาต override กล้องจาก frontend ได้ (ไม่ส่งมาก็ใช้ค่า default จาก env)
-    cam_idx: Optional[int] = Query(None, ge=0, description="camera index"),
-    cam_backend: Optional[str] = Query(None, description="camera backend (auto|dshow|msmf|v4l2|avfoundation)"),
     db: Session = Depends(get_db),
 ):
     ensure_open(db, purchase_id)
 
-    # 1) ดึงสินค้า
+    # --- decode base64 → bytes ---
+    try:
+        img_bytes = base64.b64decode(body.photo_base64, validate=True)
+        if not img_bytes:
+            raise ValueError("empty image")
+    except Exception:
+        raise HTTPException(status_code=400, detail="photo_base64 ไม่ถูกต้อง")
+
+    # --- ดึงสินค้า ---
     prod = db.execute(
         text("SELECT prod_name, prod_price FROM product WHERE prod_id=:id"),
         {"id": body.prod_id}
@@ -263,41 +317,22 @@ def add_item(
     if not prod:
         raise HTTPException(status_code=400, detail="Product not found")
 
-    # 2) เรียก hardware_service /camera/snap ด้วย **GET** และใส่พารามิเตอร์กล้อง
-    params = {
-        "idx": HARDWARE_CAM_IDX if cam_idx is None else cam_idx,
-        "backend": HARDWARE_CAM_BACKEND if not cam_backend else cam_backend,
-    }
-    try:
-        r = requests.get(f"{HARDWARE_URL}/camera/snap", params=params, timeout=20)
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Hardware unreachable: {e}")
-
-    if r.status_code != 200:
-        # พยายามดึงข้อความ error จาก JSON ถ้ามี
-        msg = None
-        try:
-            msg = r.json().get("detail")
-        except Exception:
-            msg = r.text
-        raise HTTPException(status_code=502, detail=f"Snap failed: {msg}")
-
-    captured_bytes = r.content
-    if not captured_bytes:
-        raise HTTPException(status_code=502, detail="No image data from hardware (snap)")
-
-    # 3) คำนวณราคา (ทุกอย่างเป็น Decimal เท่านั้น)
-    # prod_price อาจเป็น float/str/Decimal → บังคับแปลง
+    # --- คำนวณราคา ---
     unit_price = _to_decimal(prod["prod_price"])
     raw_price = body.weight * unit_price
     total_price = _round_money_step_2dp(raw_price, mode=round_mode, step=round_step)
 
-    # 4) บันทึก DB + ไฟล์แบบ transactional
+    # --- เตรียม path ไฟล์ ---
+    target_dir = Path(ITEM_DIR)
+    target_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{uuid.uuid4().hex}.jpg"
-    abs_path = os.path.join(ITEM_DIR, fname)
+    abs_path = target_dir / fname
+    rel_path = f"/uploads/purchase_items/{fname}"
 
+    # --- บันทึก DB + ไฟล์แบบ transactional ---
+    tmp_path: Optional[Path] = None
     try:
-        # 4.1 insert item
+        # insert item
         item = db.execute(text("""
             INSERT INTO purchase_items (purchase_id, prod_id, weight, price)
             VALUES (:pid, :prod, :w, :p)
@@ -305,36 +340,44 @@ def add_item(
         """), {"pid": purchase_id, "prod": body.prod_id, "w": body.weight, "p": total_price}
         ).mappings().first()
 
-        # 4.2 save file
-        with open(abs_path, "wb") as f:
-            f.write(captured_bytes)
+        # write temp → atomic replace
+        with tempfile.NamedTemporaryFile(dir=target_dir, delete=False) as tmp:
+            tmp.write(img_bytes)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, abs_path)
 
-        # 4.3 insert photo row
+        # insert photo row
         photo = db.execute(text("""
             INSERT INTO purchase_item_photos (purchase_item_id, img_path)
             VALUES (:iid, :p)
             RETURNING photo_id, img_path
-        """), {"iid": item["purchase_item_id"], "p": f"/uploads/purchase_items/{fname}"}).mappings().first()
+        """), {"iid": item["purchase_item_id"], "p": str(rel_path)}).mappings().first()
 
         db.commit()
 
     except Exception as e:
         db.rollback()
-        # ถ้าไฟล์ถูกสร้างแล้วให้ลบคืน
+        # เก็บบ้าน: ลบ temp ถ้าเหลือ
+        if tmp_path and tmp_path.exists():
+            try: tmp_path.unlink()
+            except: pass
+        # ลบไฟล์หลักถ้าถูกเขียนไปแล้ว
         try:
-            if os.path.exists(abs_path):
-                os.remove(abs_path)
-        except Exception:
-            pass
+            if abs_path.exists():
+                abs_path.unlink()
+        except: pass
+
         raise HTTPException(status_code=500, detail=f"Failed to save item/photo: {e}")
 
-    # 5) ส่งออก (แปลง Decimal เป็น string อัตโนมัติ)
-    payload = dict(item)
-    payload.update({
+    # ส่งออก (ให้แปลง Decimal เป็น string ถ้าใช้ JSONResponse)
+    out = dict(item)
+    out.update({
         "prod_name": prod["prod_name"],
-        "photos": [PhotoOut(photo_id=photo["photo_id"], img_path=photo["img_path"])],
+        "photos": [{"photo_id": photo["photo_id"], "img_path": photo["img_path"]}],
     })
-    return JSONResponse(content=jsonable_encoder(payload, custom_encoder={Decimal: str}))
+    return ItemOut(**out)
 
 # ---------- 5) แก้ไข "ราคา" เท่านั้น (มีโหมดปัดราคา) ----------
 @router.put("/{purchase_id}/items/{item_id}", response_model=ItemOut)
@@ -347,7 +390,7 @@ def update_item_price_only(
         pattern="^(half_up|up|down|none)$",
         description="โหมดปัดราคา: half_up|up|down|none (เริ่มต้น: half_up)"
     ),
-    round_step: Optional[Dec] = Query(  # ✅ เปลี่ยนเป็น Dec
+    round_step: Optional[Dec] = Query(  
         None,
         description="ช่วงปัด (step) เช่น 0.25, 0.50, 1.00; ว่าง = ไม่ใช้ขั้น"
     ),
