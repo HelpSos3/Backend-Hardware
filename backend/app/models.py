@@ -1,4 +1,3 @@
-from sqlalchemy import text
 from .database import engine
 
 DDL = """
@@ -100,13 +99,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_product_categories_lower_name
 CREATE TABLE IF NOT EXISTS product_inventory_totals (
     prod_id INT PRIMARY KEY REFERENCES product(prod_id) ON DELETE CASCADE,
     purchased_weight DECIMAL(14,2) NOT NULL DEFAULT 0,
-    sold_weight      DECIMAL(14,2) NOT NULL DEFAULT 0,
-    balance_weight   DECIMAL(14,2) GENERATED ALWAYS AS (purchased_weight - sold_weight) STORED
+    sold_weight      DECIMAL(14,2) NOT NULL DEFAULT 0
 );
-
-CREATE INDEX IF NOT EXISTS ix_product_inventory_totals_balance
-    ON product_inventory_totals (balance_weight);
-
 """
 
 def create_tables():

@@ -1,5 +1,5 @@
 # backend/app/routers/products.py
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 from decimal import Decimal
@@ -7,50 +7,56 @@ from typing import Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import os, uuid, shutil
-from fastapi import Query
 from app.database import SessionLocal
 
 router = APIRouter(prefix="/products", tags=["products"])
 
 # ====== CONFIG & HELPERS ======
-UPLOAD_DIR = "/app/app/uploads/products"  # ตรงกับ main.py ที่ mount /uploads -> app/uploads
+# ใช้ ENV เป็นแหล่งความจริง (ตั้งใน docker-compose: UPLOAD_ROOT=/app/uploads)
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/uploads")
+PRODUCT_SUBDIR = "products"
+UPLOAD_DIR = os.path.join(UPLOAD_ROOT, PRODUCT_SUBDIR)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# root ของ uploads เพื่อประกอบ path เวลาลบไฟล์เก่า
-UPLOAD_ROOT = os.path.dirname(UPLOAD_DIR)  # "/app/app/uploads"
 
 ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
+def _safe_rel(rel_path: Optional[str]) -> Optional[str]:
+    if not rel_path:
+        return None
+    # กัน path traversal
+    return rel_path.replace("..", "").lstrip("/\\").replace("\\", "/")
+
+def _abs_from_rel(rel_path: str) -> str:
+    safe_rel = _safe_rel(rel_path)
+    return os.path.join(UPLOAD_ROOT, safe_rel)
+
 def save_image(file: UploadFile | None) -> Optional[str]:
-    """บันทึกรูปภาพลงดิสก์และคืนค่า relative path เช่น 'products/xxxx.jpg'"""
+    """บันทึกรูป -> คืนค่า relative path เช่น 'products/xxxx.jpg'"""
     if not file:
         return None
-    # ตรวจนามสกุล
     _, ext = os.path.splitext(file.filename or "")
     ext = ext.lower()
     if ext not in ALLOWED_EXT:
         raise HTTPException(status_code=400, detail="รองรับไฟล์เฉพาะ .jpg .jpeg .png .webp")
-
     fname = f"{uuid.uuid4().hex}{ext}"
     abs_path = os.path.join(UPLOAD_DIR, fname)
     # เขียนไฟล์
     with open(abs_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
-
-    # relative path (ไว้ให้ frontend ประกอบเป็น /uploads/products/<fname>)
-    return f"products/{fname}"
+    # คืน path แบบ relative (ให้ frontend ไปประกอบเป็น /uploads/<rel>)
+    return f"{PRODUCT_SUBDIR}/{fname}"
 
 def delete_image(rel_path: Optional[str]) -> None:
-    """ลบไฟล์รูปจากดิสก์ ถ้ามี เช่น rel_path='products/xxx.jpg'"""
-    if not rel_path:
+    """ลบไฟล์รูปจากดิสก์ ถ้ามี เช่น 'products/xxx.jpg'"""
+    safe_rel = _safe_rel(rel_path)
+    if not safe_rel:
         return
-    safe_rel = rel_path.replace("..", "").lstrip("/\\")
     abs_path = os.path.join(UPLOAD_ROOT, safe_rel)
     try:
         if os.path.isfile(abs_path):
             os.remove(abs_path)
     except Exception:
-        # อย่าทำให้ API พังเพราะลบรูปไม่สำเร็จ
+        # ไม่ให้ API พังเพราะลบไม่สำเร็จ
         pass
 
 # ====== DB session ======
@@ -61,7 +67,7 @@ def get_db():
     finally:
         db.close()
 
-# ====== Schemas (สำหรับ response / JSON-only case) ======
+# ====== Schemas ======
 class ProductOut(BaseModel):
     prod_id: int
     prod_img: Optional[str] = None
@@ -85,7 +91,7 @@ class ProductUpdate(BaseModel):
 
 class ProductOption(BaseModel):
     value: int   # prod_id
-    label: str   # ชื่อที่โชว์    
+    label: str   # display name
 
 # ====== LIST ======
 @router.get("/", response_model=List[ProductOut])
@@ -119,7 +125,6 @@ async def create_product(
     imageFile: UploadFile | None = File(None),
     db: Session = Depends(get_db),
 ):
-    # ตรวจว่าหมวดหมู่มีจริง
     category = db.execute(
         text("SELECT category_id, category_name FROM product_categories WHERE category_id = :cid"),
         {"cid": category_id},
@@ -127,22 +132,15 @@ async def create_product(
     if not category:
         raise HTTPException(status_code=400, detail="Category not found")
 
-    # บันทึกรูปถ้ามี
     img_rel = save_image(imageFile)
 
-    # Insert
     row = db.execute(
         text("""
             INSERT INTO product (prod_img, prod_name, prod_price, category_id)
             VALUES (:img, :name, :price, :cid)
             RETURNING prod_id, prod_img, prod_name, prod_price, category_id, is_active
         """),
-        {
-            "img": img_rel,
-            "name": prod_name.strip(),
-            "price": prod_price,
-            "cid": category_id,
-        },
+        {"img": img_rel, "name": prod_name.strip(), "price": prod_price, "cid": category_id},
     ).mappings().first()
     db.commit()
 
@@ -150,7 +148,7 @@ async def create_product(
     result["category_name"] = category["category_name"]
     return result
 
-# ====== UPDATE (PUT แบบ multipart/form-data เหมือน POST) ======
+# ====== UPDATE (PUT แบบ multipart/form-data) ======
 @router.put("/{prod_id}", response_model=ProductOut)
 async def update_product(
     prod_id: int,
@@ -160,15 +158,10 @@ async def update_product(
     imageFile: UploadFile | None = File(None),
     db: Session = Depends(get_db),
 ):
-    # มีสินค้านี้ไหม
-    current = db.execute(
-        text("SELECT * FROM product WHERE prod_id = :pid"),
-        {"pid": prod_id},
-    ).mappings().first()
+    current = db.execute(text("SELECT * FROM product WHERE prod_id = :pid"), {"pid": prod_id}).mappings().first()
     if not current:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # ตรวจหมวดหมู่มีจริง
     cat = db.execute(
         text("SELECT category_id, category_name FROM product_categories WHERE category_id = :cid"),
         {"cid": category_id},
@@ -176,17 +169,14 @@ async def update_product(
     if not cat:
         raise HTTPException(status_code=400, detail="Category not found")
 
-    # ถ้ามีรูปใหม่ -> เซฟใหม่และลบรูปเก่า
     new_img_rel = current["prod_img"]
     if imageFile is not None and imageFile.filename:
         new_img_rel = save_image(imageFile)
-        # ลบไฟล์เก่า (ถ้ามี)
         try:
             delete_image(current["prod_img"])
         except Exception:
             pass
 
-    # อัปเดตข้อมูล
     row = db.execute(
         text("""
             UPDATE product
@@ -197,13 +187,7 @@ async def update_product(
              WHERE prod_id = :pid
          RETURNING prod_id, prod_img, prod_name, prod_price, category_id , is_active
         """),
-        {
-            "img": new_img_rel,
-            "name": prod_name.strip(),
-            "price": prod_price,
-            "cid": category_id,
-            "pid": prod_id,
-        },
+        {"img": new_img_rel, "name": prod_name.strip(), "price": prod_price, "cid": category_id, "pid": prod_id},
     ).mappings().first()
     db.commit()
 
@@ -221,15 +205,10 @@ async def patch_product(
     imageFile: UploadFile | None = File(None),
     db: Session = Depends(get_db),
 ):
-    # เช็คสินค้าว่ามีอยู่จริง
-    current = db.execute(
-        text("SELECT * FROM product WHERE prod_id = :pid"),
-        {"pid": prod_id},
-    ).mappings().first()
+    current = db.execute(text("SELECT * FROM product WHERE prod_id = :pid"), {"pid": prod_id}).mappings().first()
     if not current:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # ถ้าขอเปลี่ยนหมวด ตรวจว่ามีจริง
     if category_id is not None:
         cat = db.execute(
             text("SELECT category_id FROM product_categories WHERE category_id = :cid"),
@@ -238,19 +217,14 @@ async def patch_product(
         if not cat:
             raise HTTPException(status_code=400, detail="Category not found")
 
-    # จัดการรูปภาพ (ถ้ามีไฟล์ใหม่)
     new_img_rel = None
     if imageFile is not None:
-        # ถ้า filename มีค่า แปลว่าต้องการอัปเดตรูป
         if imageFile.filename:
             new_img_rel = save_image(imageFile)
-            # ลบรูปเก่าถ้ามี
             delete_image(current["prod_img"])
         else:
-            # ส่งไฟล์ว่าง -> ไม่เปลี่ยนรูป
             new_img_rel = current["prod_img"]
 
-    # รวมค่าใหม่
     new_vals = {
         "img": (new_img_rel if imageFile is not None else current["prod_img"]),
         "name": (prod_name.strip() if prod_name is not None else current["prod_name"]),
@@ -282,8 +256,7 @@ async def patch_product(
     result["category_name"] = cat["category_name"] if cat else None
     return result
 
-
-
+# ====== LIST BY CATEGORY / SEARCH / TOGGLE ACTIVE (เหมือนเดิม)… ======
 @router.get("/by-category/{category_id}", response_model=List[ProductOut])
 def list_products_by_category(category_id: int, db: Session = Depends(get_db)):
     sql = """
@@ -326,18 +299,12 @@ def search_products_by_name(
       ORDER BY p.prod_name ASC, p.prod_id ASC
       LIMIT :limit OFFSET :offset
     """
-    rows = db.execute(
-        text(sql),
-        {"q": f"%{q.strip()}%", "limit": limit, "offset": offset},
-    ).mappings().all()
+    rows = db.execute(text(sql), {"q": f"%{q.strip()}%", "limit": limit, "offset": offset}).mappings().all()
     return rows
 
 @router.put("/{prod_id}/active", response_model=ProductOut)
 def toggle_product_active(prod_id: int, is_active: bool, db: Session = Depends(get_db)):
-    current = db.execute(
-        text("SELECT * FROM product WHERE prod_id = :pid"),
-        {"pid": prod_id}
-    ).mappings().first()
+    current = db.execute(text("SELECT * FROM product WHERE prod_id = :pid"), {"pid": prod_id}).mappings().first()
     if not current:
         raise HTTPException(status_code=404, detail="Product not found")
 
@@ -348,13 +315,13 @@ def toggle_product_active(prod_id: int, is_active: bool, db: Session = Depends(g
              WHERE prod_id = :pid
          RETURNING prod_id, prod_img, prod_name, prod_price, category_id, is_active
         """),
-        {"pid": prod_id, "active": is_active}
+        {"pid": prod_id, "active": is_active},
     ).mappings().first()
     db.commit()
 
     cat = db.execute(
         text("SELECT category_name FROM product_categories WHERE category_id = :cid"),
-        {"cid": row["category_id"]}
+        {"cid": row["category_id"]},
     ).mappings().first()
 
     result = dict(row)

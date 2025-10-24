@@ -62,56 +62,56 @@ def list_inventory_items(
     offset = (page - 1) * per_page
 
     sql = text("""
-    WITH latest_sale AS (
-      SELECT
-        ss.prod_id,
-        ss.weight_sold,
-        ss.sale_date,
-        ROW_NUMBER() OVER (
-          PARTITION BY ss.prod_id
-          ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
-        ) AS rn
-      FROM stock_sales ss
-    ),
-    agg_latest AS (
-      SELECT
-        prod_id,
-        sale_date  AS last_sale_date,
-        weight_sold AS last_sold_qty
-      FROM latest_sale
-      WHERE rn = 1
-    )
-    SELECT
-      p.prod_id,
-      p.prod_name,
-      p.prod_img,
-      pc.category_id,
-      pc.category_name,
-      pit.balance_weight,
-      al.last_sale_date,
-      al.last_sold_qty
-    FROM product p
-    LEFT JOIN product_categories pc ON pc.category_id = p.category_id
-     JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-    LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
-    WHERE (:only_active = FALSE OR p.is_active = TRUE)
-      AND (:category_id IS NULL OR p.category_id = :category_id)
-      AND (
-           :q IS NULL OR :q = ''
-        OR  p.prod_name ILIKE '%'||:q||'%'
-        OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
-        OR  p.prod_id::text = :q           -- ค้นด้วยตัวเลขตรง ๆ
-      )
-    ORDER BY
-      CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC,
-      CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC,
-      CASE WHEN :sort='-balance'        THEN pit.balance_weight END DESC,
-      CASE WHEN :sort='balance'         THEN pit.balance_weight END ASC,
-      CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
-      CASE WHEN :sort='name'            THEN p.prod_name END ASC,
-      p.prod_id ASC
-    LIMIT :limit OFFSET :offset;
-    """)
+          WITH latest_sale AS (
+            SELECT
+              ss.prod_id,
+              ss.weight_sold,
+              ss.sale_date,
+              ROW_NUMBER() OVER (
+                PARTITION BY ss.prod_id
+                ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
+              ) AS rn
+            FROM stock_sales ss
+          ),
+          agg_latest AS (
+            SELECT
+              prod_id,
+              sale_date  AS last_sale_date,
+              weight_sold AS last_sold_qty
+            FROM latest_sale
+            WHERE rn = 1
+          )
+          SELECT
+            p.prod_id,
+            p.prod_name,
+            p.prod_img,
+            pc.category_id,
+            pc.category_name,
+            (COALESCE(pit.purchased_weight,0) - COALESCE(pit.sold_weight,0)) AS balance_weight,
+            al.last_sale_date,
+            al.last_sold_qty
+          FROM product p
+          LEFT JOIN product_categories pc ON pc.category_id = p.category_id
+          JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
+          LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
+          WHERE (:only_active = FALSE OR p.is_active = TRUE)
+            AND (:category_id IS NULL OR p.category_id = :category_id)
+            AND (
+                :q IS NULL OR :q = ''
+              OR  p.prod_name ILIKE '%'||:q||'%'
+              OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+              OR  p.prod_id::text = :q
+            )
+          ORDER BY
+            CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC,
+            CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC,
+            CASE WHEN :sort='-balance'        THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END DESC,
+            CASE WHEN :sort='balance'         THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END ASC,
+            CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
+            CASE WHEN :sort='name'            THEN p.prod_name END ASC,
+            p.prod_id ASC
+          LIMIT :limit OFFSET :offset;
+          """)
 
     sql_count = text("""
       SELECT COUNT(*)
@@ -164,40 +164,66 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
 
     created = []
     try:
-        # ใช้ transaction
         with db.begin():
-            # ตรวจแยกรายการตามสินค้า แล้วล็อกแถว totals แบบ select for update เพื่อกันแข่ง
             prod_ids = {line.prod_id for line in lines}
-            # preload & lock
-            lock_sql = text("SELECT prod_id, purchased_weight, sold_weight, balance_weight FROM product_inventory_totals WHERE prod_id = ANY(:ids) FOR UPDATE")
-            db.execute(lock_sql, {"ids": list(prod_ids)})
 
-            # ดึงคงเหลือปัจจุบันทั้งหมด
-            cur_sql = text("""
-                SELECT p.prod_id, COALESCE(pit.balance_weight, 0) AS balance_weight
+            # 0) ตรวจว่าสินค้ามีอยู่จริงทุกตัว
+            exist_sql = text("SELECT prod_id FROM product WHERE prod_id = ANY(:ids)")
+            exist_set = {r["prod_id"] for r in db.execute(exist_sql, {"ids": list(prod_ids)}).mappings().all()}
+            missing = prod_ids - exist_set
+            if missing:
+                raise HTTPException(status_code=404, detail=f"product not found: {sorted(missing)}")
+
+            # 1) ensure totals row (กรณีมีสินค้าที่เพิ่งสร้างแต่ยังไม่เคยมีการซื้อ/ขาย)
+            ensure_sql = text("""
+                INSERT INTO product_inventory_totals (prod_id, purchased_weight, sold_weight)
+                SELECT p.prod_id, 0, 0
                 FROM product p
-                 JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-                WHERE p.prod_id = ANY(:ids)
+                LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
+                WHERE p.prod_id = ANY(:ids) AND pit.prod_id IS NULL
+                ON CONFLICT (prod_id) DO NOTHING
+            """)
+            db.execute(ensure_sql, {"ids": list(prod_ids)})
+
+            # 2) ล็อกแถว totals ที่เกี่ยวข้อง
+            lock_sql = text("""
+                SELECT prod_id, purchased_weight, sold_weight
+                FROM product_inventory_totals
+                WHERE prod_id = ANY(:ids)
                 FOR UPDATE
             """)
-            balances = {r["prod_id"]: float(r["balance_weight"]) for r in db.execute(cur_sql, {"ids": list(prod_ids)}).mappings().all()}
+            db.execute(lock_sql, {"ids": list(prod_ids)})
 
-            # ตรวจไม่ให้ติดลบ
-            # รวมยอดต่อ prod_id ในกรณีมีซ้ำ
-            aggregate = {}
+            # 3) อ่านคงเหลือแบบคำนวณ (ภายใต้ FOR UPDATE)
+            cur_sql = text("""
+                SELECT pit.prod_id,
+                       (COALESCE(pit.purchased_weight,0) - COALESCE(pit.sold_weight,0)) AS balance_weight
+                FROM product_inventory_totals pit
+                WHERE pit.prod_id = ANY(:ids)
+                FOR UPDATE
+            """)
+            balances = {
+                r["prod_id"]: float(r["balance_weight"])
+                for r in db.execute(cur_sql, {"ids": list(prod_ids)}).mappings().all()
+            }
+
+            # 4) รวมยอด/ตรวจไม่ให้ติดลบ
+            aggregate: Dict[int, float] = {}
             for line in lines:
                 aggregate[line.prod_id] = aggregate.get(line.prod_id, 0.0) + float(line.weight_sold)
 
             for pid, qty in aggregate.items():
-                if pid not in balances:
-                    raise HTTPException(status_code=404, detail=f"product {pid} not found")
                 if qty <= 0:
                     raise HTTPException(status_code=400, detail=f"weight_sold must be > 0 for product {pid}")
-                if qty > balances[pid]:
-                    raise HTTPException(status_code=409, detail=f"insufficient balance for product {pid}: {qty} > {balances[pid]}")
+                if qty > balances.get(pid, 0.0):
+                    raise HTTPException(status_code=409, detail=f"insufficient balance for product {pid}: {qty} > {balances.get(pid, 0.0)}")
 
-            # แทรกแถวขายออก (trigger จะอัพเดต totals ให้อัตโนมัติ)
-            insert_sql = text("INSERT INTO stock_sales (prod_id, weight_sold) VALUES (:pid, :qty) RETURNING stock_sales_id, sale_date")
+            # 5) แทรกขายออก (trigger จะอัพเดต totals ให้เอง)
+            insert_sql = text("""
+                INSERT INTO stock_sales (prod_id, weight_sold)
+                VALUES (:pid, :qty)
+                RETURNING stock_sales_id, sale_date
+            """)
             for line in lines:
                 row = db.execute(insert_sql, {"pid": line.prod_id, "qty": float(line.weight_sold)}).mappings().first()
                 created.append({
@@ -208,12 +234,11 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
                 })
 
         return SellBulkResult(ok=True, created=created)
+
     except HTTPException:
         raise
     except Exception as e:
-        # rollback อัตโนมัติด้วย context manager
         raise HTTPException(status_code=500, detail=str(e))
-
 # ----------- GET /inventory/export -----------
 @router.get("/export")
 def export_inventory_excel(
@@ -225,55 +250,55 @@ def export_inventory_excel(
 ):
     # --- Query เดิม ---
     sql = """
-    WITH latest_sale AS (
-      SELECT
-        ss.prod_id,
-        ss.weight_sold,
-        ss.sale_date,
-        ROW_NUMBER() OVER (
-          PARTITION BY ss.prod_id
-          ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
-        ) AS rn
-      FROM stock_sales ss
-    ),
-    agg_latest AS (
-      SELECT
-        prod_id,
-        sale_date  AS last_sale_date,
-        weight_sold AS last_sold_qty
-      FROM latest_sale
-      WHERE rn = 1
-    )
-    SELECT
-      p.prod_id,
-      p.prod_name,
-      p.prod_img,
-      pc.category_id,
-      pc.category_name,
-      pit.balance_weight,
-      al.last_sale_date,
-      al.last_sold_qty
-    FROM product p
-    LEFT JOIN product_categories pc ON pc.category_id = p.category_id
-    LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-    LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
-    WHERE (:only_active = FALSE OR p.is_active = TRUE)
-      AND (:category_id IS NULL OR p.category_id = :category_id)
-      AND (
-           :q IS NULL OR :q = ''
-        OR  p.prod_name ILIKE '%'||:q||'%'
-        OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
-        OR  p.prod_id::text = :q
-      )
-    ORDER BY
-      CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC,
-      CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC,
-      CASE WHEN :sort='-balance'        THEN pit.balance_weight END DESC,
-      CASE WHEN :sort='balance'         THEN pit.balance_weight END ASC,
-      CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
-      CASE WHEN :sort='name'            THEN p.prod_name END ASC,
-      p.prod_id ASC
-    """
+WITH latest_sale AS (
+  SELECT
+    ss.prod_id,
+    ss.weight_sold,
+    ss.sale_date,
+    ROW_NUMBER() OVER (
+      PARTITION BY ss.prod_id
+      ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
+    ) AS rn
+  FROM stock_sales ss
+),
+agg_latest AS (
+  SELECT
+    prod_id,
+    sale_date  AS last_sale_date,
+    weight_sold AS last_sold_qty
+  FROM latest_sale
+  WHERE rn = 1
+)
+SELECT
+  p.prod_id,
+  p.prod_name,
+  p.prod_img,
+  pc.category_id,
+  pc.category_name,
+  (COALESCE(pit.purchased_weight,0) - COALESCE(pit.sold_weight,0)) AS balance_weight,
+  al.last_sale_date,
+  al.last_sold_qty
+FROM product p
+LEFT JOIN product_categories pc ON pc.category_id = p.category_id
+LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
+LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
+WHERE (:only_active = FALSE OR p.is_active = TRUE)
+  AND (:category_id IS NULL OR p.category_id = :category_id)
+  AND (
+       :q IS NULL OR :q = ''
+    OR  p.prod_name ILIKE '%'||:q||'%'
+    OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+    OR  p.prod_id::text = :q
+  )
+ORDER BY
+  CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC,
+  CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC,
+  CASE WHEN :sort='-balance'        THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END DESC,
+  CASE WHEN :sort='balance'         THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END ASC,
+  CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
+  CASE WHEN :sort='name'            THEN p.prod_name END ASC,
+  p.prod_id ASC
+"""
 
     rows = db.execute(text(sql), {
         "category_id": category_id,

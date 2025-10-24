@@ -1,6 +1,6 @@
 # app/routers/idcard.py
 from fastapi import APIRouter, HTTPException, Query
-import base64, os, requests
+import base64
 
 from ..devices.idcard_thai.ThaiCIDHelper import ThaiCIDHelper, searchDATAValue, searchAPDUPhoto
 from ..devices.idcard_thai.DataThaiCID import (

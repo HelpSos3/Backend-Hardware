@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse , JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
-import os, datetime, io, textwrap
+import os, datetime, io
+import base64 as _b64
 
 # ===== Optional ESC/POS text mode deps =====
 try:
@@ -31,6 +33,11 @@ class ReceiptData(BaseModel):
     items: List[ReceiptItem]
     total: float
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
+    from PIL import ImageDraw as PILDraw
+    from PIL import ImageFont as PILFont
 
 # ===================== Config =====================
 def _cfg_printer_name() -> str:
@@ -88,6 +95,12 @@ def _cfg_font_path() -> Optional[str]:
             return p
     return None
 
+def _cfg_dpi() -> int:
+    # Thermal ทั่วไป 203 DPI (8 dot/mm). ถ้าเครื่องคุณ 300 DPI ก็เปลี่ยนเป็น 300
+    try:
+        return int(os.getenv("RECEIPT_DPI", "203"))
+    except Exception:
+        return 203
 
 # ===================== ESC/POS helpers (text mode) =====================
 ESC = b"\x1b"
@@ -179,12 +192,21 @@ def build_receipt_bytes_text(data: ReceiptData) -> bytes:
     return buf
 
 
+def _image_to_jpeg_bytes(img: "PILImage.Image", quality: int = 90) -> bytes:
+    _ensure_pillow()
+    buf = io.BytesIO()
+    dpi = _cfg_dpi()
+    # ฝัง DPI เพื่อให้พิมพ์ “ขนาดจริง”
+    img.convert("L").save(buf, format="JPEG", quality=quality, optimize=True, dpi=(dpi, dpi))
+    return buf.getvalue()
+
+
 # ===================== IMAGE MODE (recommended) =====================
 def _ensure_pillow():
     if Image is None or ImageDraw is None or ImageFont is None:
         raise HTTPException(500, "Pillow is not installed. Run: pip install pillow")
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
+def _load_font(size: int) -> PILFont.FreeTypeFont:
     _ensure_pillow()
     font_path = _cfg_font_path()
     if not font_path:
@@ -194,14 +216,14 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     except Exception as e:
         raise HTTPException(500, f"Cannot load font: {font_path} ({e})")
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple:
+def _text_size(draw: PILDraw.ImageDraw, text: str, font: PILFont.ImageFont) -> tuple:
     # ใช้ getlength ถ้ามี เพื่อความแม่นสำหรับอักษรไทย
     if hasattr(font, "getlength"):
         return (int(font.getlength(text)), font.size)
     else:
         return draw.textsize(text, font=font)
 
-def build_receipt_image(data: ReceiptData, width_px: int) -> Image.Image:
+def build_receipt_image(data: ReceiptData, width_px: int) -> PILImage.Image:
     """
     เรนเดอร์ใบเสร็จเป็นภาพขาวดำ (1-bit) สำหรับ ESC/POS raster
     """
@@ -297,7 +319,9 @@ def build_receipt_image(data: ReceiptData, width_px: int) -> Image.Image:
     img = img.convert("1")
     return img
 
-def _image_to_escpos_raster(img: "Image.Image") -> bytes:
+
+
+def _image_to_escpos_raster(img: "PILImage.Image") -> bytes:
     """
     แปลงภาพ 1-bit เป็นคำสั่ง ESC/POS raster:
     GS v 0 m xL xH yL yH [data]
@@ -369,6 +393,33 @@ def print_receipt(data: ReceiptData):
         _end_doc(h)
 
     return {"status": "ok", "printer": name, "mode": _cfg_mode()}
+
+@router.post("/render")
+def render_receipt_image(data: ReceiptData):
+    """
+    เรนเดอร์ใบเสร็จเป็นภาพ JPEG (โดยไม่สั่งพิมพ์)
+    เหมาะให้ backend ดึงไปเก็บไฟล์แนบในฐานข้อมูล/อัปโหลด
+    """
+    width_px = _cfg_img_width_px()
+    img = build_receipt_image(data, width_px)
+    jpeg_bytes = _image_to_jpeg_bytes(img)
+
+    return StreamingResponse(
+        io.BytesIO(jpeg_bytes),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"}
+    )
+
+@router.post("/render_base64")
+def render_receipt_image_base64(data: ReceiptData):
+    """
+    เหมือน /render แต่ห่อเป็น base64 ใน JSON
+    """
+    width_px = _cfg_img_width_px()
+    img = build_receipt_image(data, width_px)
+    jpeg_bytes = _image_to_jpeg_bytes(img)
+    b64 = _b64.b64encode(jpeg_bytes).decode("ascii")
+    return JSONResponse({"image_base64": b64, "mime": "image/jpeg"})
 
 
 

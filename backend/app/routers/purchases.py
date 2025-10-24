@@ -23,7 +23,7 @@ def get_db():
         db.close()
 
 # ====== config ======
-UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/app/uploads")
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/uploads")
 HARDWARE_URL = os.getenv("HARDWARE_URL", "http://host.docker.internal:9000")
 os.makedirs(os.path.join(UPLOAD_ROOT, "customer_photos"), exist_ok=True)
 os.makedirs(os.path.join(UPLOAD_ROOT, "idcard_photos"), exist_ok=True)
@@ -403,23 +403,19 @@ def quick_open_anonymous_preview(
 ):
     try:
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            # ทางหลัก: GET /camera/snap
-            resp = client.get(
-                f"{HARDWARE_URL}/camera/snap",
+            # เรียกกล้องโดยตรงผ่าน /camera/capture เท่านั้น
+            resp = client.post(
+                f"{HARDWARE_URL}/camera/capture",
                 params={"device_index": device_index, "warmup": warmup},
-                headers={"Accept": "image/jpeg"},
             )
-
-            if resp.status_code in (404, 405):  # ไม่เจอหรือ method ไม่รองรับ → fallback
-                resp = client.post(
-                    f"{HARDWARE_URL}/camera/capture",
-                    params={"device_index": device_index, "warmup": warmup},
-                )
 
             resp.raise_for_status()
             ct = (resp.headers.get("content-type") or "").lower()
             if "image" not in ct:
-                raise HTTPException(status_code=502, detail=f"unexpected content-type from hardware: {ct}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"unexpected content-type from hardware: {ct}"
+                )
 
             img_bytes = resp.content
 

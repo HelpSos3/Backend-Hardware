@@ -1,4 +1,5 @@
-# backend/app/main.py
+import os
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -27,8 +28,9 @@ app.add_middleware(
     allow_headers=["*"],     # อนุญาตทุก header รวมถึง Content-Type, Authorization
 )
 
-# เสิร์ฟไฟล์อัปโหลด: /uploads/** -> backend/app/uploads/**
-app.mount("/uploads", StaticFiles(directory="app/uploads"), name="uploads")
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/uploads")
+Path(UPLOAD_ROOT).mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_ROOT), name="uploads")
 
 @app.options("/{full_path:path}")
 def preflight_handler(full_path: str) -> Response:

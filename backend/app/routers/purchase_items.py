@@ -10,11 +10,10 @@ import os, uuid, base64, tempfile, httpx
 from pathlib import Path
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
-import shutil
 router = APIRouter(prefix="/purchases", tags=["purchase_items"])
 
 # ---------- CONFIG ----------
-UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/app/uploads")
+UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "/app/uploads")
 ITEM_DIR = os.path.join(UPLOAD_ROOT, "purchase_items")
 os.makedirs(ITEM_DIR, exist_ok=True)
 
@@ -128,32 +127,6 @@ class ProductOut(BaseModel):
     prod_img: Optional[str] = None
 
 # ---------- Photo Helpers ----------
-def _save_item_photos(item_id: int, files: List[UploadFile] | None, db: Session) -> List[PhotoOut]:
-    if not files:
-        return []
-    results: List[PhotoOut] = []
-    for f in files:
-        if not f or not f.filename:
-            continue
-        _, ext = os.path.splitext(f.filename or "")
-        ext = (ext or "").lower()
-        if ext not in ALLOWED_EXT:
-            raise HTTPException(status_code=400, detail="รองรับไฟล์เฉพาะ .jpg .jpeg .png .webp")
-
-        fname = f"{uuid.uuid4().hex}{ext}"
-        abs_path = os.path.join(ITEM_DIR, fname)
-        with open(abs_path, "wb") as out:
-            shutil.copyfileobj(f.file, out)
-
-        row = db.execute(
-            text("""INSERT INTO purchase_item_photos (purchase_item_id, img_path)
-                    VALUES (:iid, :p)
-                 RETURNING photo_id, img_path"""),
-            {"iid": item_id, "p": f"/uploads/purchase_items/{fname}"}
-        ).mappings().first()
-        results.append(PhotoOut(photo_id=row["photo_id"], img_path=row["img_path"]))
-    return results
-
 def _get_item_photos(db: Session, item_id: int) -> List[PhotoOut]:
     rows = db.execute(
         text("""SELECT photo_id, img_path

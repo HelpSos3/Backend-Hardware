@@ -33,18 +33,14 @@ services:
       - .env
     environment:
       HARDWARE_URL: http://host.docker.internal:9000  # << ใช้คุยกับ hardware_service
-      UPLOAD_ROOT: /app/app/uploads    
+      UPLOAD_ROOT: /app/uploads    
     depends_on:
       - db
     ports:
       - "${APP_PORT}:8000"
     volumes:
-      - ./backend/app:/app/app                         # hot reload โค้ด
-      - ./uploads/products:/app/app/uploads/products  # <<< รูปอยู่นอก
-      - ./uploads/idcard_photos:/app/app/uploads/idcard_photos
-      - ./uploads/purchase_items:/app/app/uploads/purchase_items      # เพิ่ม
-      - ./uploads/payment_slips:/app/app/uploads/payment_slips
-      - ./uploads/customer_photos:/app/app/uploads/customer_photos
+    - ./backend/app:/app/app
+    - ./uploads:/app/uploads
 
 volumes:
   db_data:

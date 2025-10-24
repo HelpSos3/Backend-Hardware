@@ -8,3 +8,4 @@ requests
 opencv-python
 pywin32==306
 pillow 
+numpy
