@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse , JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 import os, datetime, io
 import base64 as _b64
 
@@ -13,12 +13,17 @@ except Exception:
     win32print = None
 
 # ===== Pillow for image mode =====
+# Pillow runtime import
 try:
     from PIL import Image, ImageDraw, ImageFont
-    PILFont = ImageFont
 except Exception:
-    Image = ImageDraw = ImageFont = None
-    PILFont = None
+    Image = ImageDraw = ImageFont = None  # type: ignore[assignment]
+
+# สำหรับ type checker เท่านั้น (ไม่รันตอนจริง)
+if TYPE_CHECKING:
+    from PIL import Image as PILImage
+    from PIL import ImageDraw as PILDraw
+    from PIL import ImageFont as PILImageFont
 
 router = APIRouter(prefix="/printer", tags=["printer"])
 
@@ -209,7 +214,7 @@ def _ensure_pillow():
     if Image is None or ImageDraw is None or ImageFont is None:
         raise HTTPException(500, "Pillow is not installed. Run: pip install pillow")
 
-def _load_font(size: int) -> PILFont.FreeTypeFont:
+def _load_font(size: int) -> "PILImageFont.FreeTypeFont":
     _ensure_pillow()
     font_path = _cfg_font_path()
     if not font_path:
@@ -219,7 +224,7 @@ def _load_font(size: int) -> PILFont.FreeTypeFont:
     except Exception as e:
         raise HTTPException(500, f"Cannot load font: {font_path} ({e})")
 
-def _text_size(draw: PILDraw.ImageDraw, text: str, font: PILFont.ImageFont) -> tuple:
+def _text_size(draw: "PILDraw.ImageDraw", text: str, font: "PILImageFont.ImageFont") -> tuple[int, int]:
     # ใช้ getlength ถ้ามี เพื่อความแม่นสำหรับอักษรไทย
     if hasattr(font, "getlength"):
         return (int(font.getlength(text)), font.size)
