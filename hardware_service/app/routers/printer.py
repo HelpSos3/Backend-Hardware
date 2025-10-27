@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse , JSONResponse
 from pydantic import BaseModel
@@ -14,8 +15,10 @@ except Exception:
 # ===== Pillow for image mode =====
 try:
     from PIL import Image, ImageDraw, ImageFont
+    PILFont = ImageFont
 except Exception:
     Image = ImageDraw = ImageFont = None
+    PILFont = None
 
 router = APIRouter(prefix="/printer", tags=["printer"])
 
