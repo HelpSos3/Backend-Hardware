@@ -38,10 +38,10 @@ CREATE TABLE IF NOT EXISTS customer_photos (
 CREATE TABLE IF NOT EXISTS purchases (
     purchase_id SERIAL PRIMARY KEY,
     customer_id INT,
-    purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    purchase_date TIMESTAMPTZ DEFAULT now(),
     purchase_status VARCHAR(10) NOT NULL DEFAULT 'OPEN'
       CHECK (purchase_status IN ('OPEN','DONE')),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );
 
@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS purchase_items (
     prod_id INT,
     weight DECIMAL(10, 2) CHECK (weight IS NULL OR weight >= 0),
     price DECIMAL(10, 2) CHECK (price IS NULL OR price >= 0),
+    purchase_items_date TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (purchase_id) REFERENCES purchases(purchase_id) ON DELETE CASCADE,
     FOREIGN KEY (prod_id) REFERENCES product(prod_id) ON DELETE CASCADE
 );
@@ -70,7 +71,7 @@ CREATE TABLE IF NOT EXISTS payment (
     purchase_id INT,
     payment_method VARCHAR(50) CHECK (payment_method IN ('เงินสด', 'เงินโอน')),
     payment_amount DECIMAL(10, 2) CHECK (payment_amount IS NULL OR payment_amount >= 0),
-    payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    payment_date TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (purchase_id) REFERENCES purchases(purchase_id)
 );
 
@@ -87,7 +88,7 @@ CREATE TABLE IF NOT EXISTS stock_sales (
     stock_sales_id SERIAL PRIMARY KEY,
     prod_id INT,
     weight_sold DECIMAL(10,2) CHECK (weight_sold IS NULL OR weight_sold >= 0),
-    sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sale_date TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (prod_id) REFERENCES product(prod_id)
 );
 
@@ -112,7 +113,7 @@ def create_tables():
         conn.exec_driver_sql("""
         CREATE OR REPLACE FUNCTION trg_set_updated_at() RETURNS TRIGGER AS $$
         BEGIN
-          NEW.updated_at = CURRENT_TIMESTAMP;
+          NEW.updated_at = now();
           RETURN NEW;
         END; $$ LANGUAGE plpgsql;
 

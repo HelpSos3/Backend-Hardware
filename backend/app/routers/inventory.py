@@ -46,6 +46,20 @@ class SellBulkResult(BaseModel):
     ok: bool
     created: List[Dict[str, Any]]
 
+class PurchaseItemRow(BaseModel):
+    purchase_item_id: int
+    purchase_id: int
+    prod_id: int
+    weight: float | None = None
+    price: float | None = None
+    purchase_items_date: datetime | None = None
+
+class PurchaseItemListResponse(BaseModel):
+    items: List[PurchaseItemRow]
+    page: int
+    per_page: int
+    total: int    
+
 SortKey = Literal["last_sale_date","-last_sale_date","name","-name","balance","-balance"]
 
 # ----------- GET /inventory/items -----------
@@ -357,4 +371,66 @@ ORDER BY
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
+    )
+
+@router.get("/purchased_history/{prod_id}", response_model=PurchaseItemListResponse)
+def get_purchased_history_raw(
+    prod_id: int,
+    date_from: Optional[datetime] = Query(None, description="เริ่มวันที่ (ISO)"),
+    date_to: Optional[datetime] = Query(None, description="สิ้นสุดวันที่ (ISO)"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    offset = (page - 1) * per_page
+
+    list_sql = text("""
+        SELECT
+            purchase_item_id,
+            purchase_id,
+            prod_id,
+            weight,
+            price,
+            purchase_items_date
+        FROM purchase_items
+        WHERE prod_id = :pid
+          AND (:date_from IS NULL OR purchase_items_date >= :date_from)
+          AND (:date_to   IS NULL OR purchase_items_date <= :date_to)
+        ORDER BY purchase_items_date DESC, purchase_item_id DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    count_sql = text("""
+        SELECT COUNT(*)
+        FROM purchase_items
+        WHERE prod_id = :pid
+          AND (:date_from IS NULL OR purchase_items_date >= :date_from)
+          AND (:date_to   IS NULL OR purchase_items_date <= :date_to)
+    """)
+
+    params = {
+        "pid": prod_id,
+        "date_from": date_from,
+        "date_to": date_to,
+        "limit": per_page,
+        "offset": offset,
+    }
+
+    rows = db.execute(list_sql, params).mappings().all()
+    total = db.execute(count_sql, params).scalar() or 0
+
+    items = [
+        PurchaseItemRow(
+            purchase_item_id=r["purchase_item_id"],
+            purchase_id=r["purchase_id"],
+            prod_id=r["prod_id"],
+            weight=float(r["weight"]) if r["weight"] is not None else None,
+            price=float(r["price"]) if r["price"] is not None else None,
+            purchase_items_date=r["purchase_items_date"],
+        )
+        for r in rows
+    ]
+
+    return PurchaseItemListResponse(
+        items=items, page=page, per_page=per_page, total=total
     )

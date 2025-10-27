@@ -10,6 +10,10 @@ import os, uuid, base64, tempfile, httpx
 from pathlib import Path
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
+from datetime import datetime
+
+
+
 router = APIRouter(prefix="/purchases", tags=["purchase_items"])
 
 # ---------- CONFIG ----------
@@ -106,6 +110,7 @@ class ItemOut(BaseModel):
     weight: Dec
     price: Dec
     prod_name: Optional[str] = None
+    purchase_items_date: Optional[datetime] = None
     photos: List[PhotoOut] = Field(default_factory=list)
 
 # ===== Models (ตัวอย่างย่อ ถ้ามีอยู่แล้วใช้ของเดิมได้) =====
@@ -184,6 +189,7 @@ def list_purchase_products(
 def list_items(purchase_id: int, db: Session = Depends(get_db)):
     rows = db.execute(text("""
       SELECT i.purchase_item_id, i.purchase_id, i.prod_id, i.weight, i.price,
+             i.purchase_items_date,                         -- <-- เพิ่ม
              p.prod_name
       FROM purchase_items i
       LEFT JOIN product p ON p.prod_id = i.prod_id
@@ -257,6 +263,7 @@ class CommitItemIn(BaseModel):
     prod_id: int
     weight: Decimal
     photo_base64: str
+    purchase_items_date: Optional[datetime] = None
 
 @router.post("/{purchase_id}/items/commit", status_code=201)
 def commit_item_with_photo(
@@ -307,10 +314,10 @@ def commit_item_with_photo(
     try:
         # insert item
         item = db.execute(text("""
-            INSERT INTO purchase_items (purchase_id, prod_id, weight, price)
-            VALUES (:pid, :prod, :w, :p)
-            RETURNING purchase_item_id, purchase_id, prod_id, weight, price
-        """), {"pid": purchase_id, "prod": body.prod_id, "w": body.weight, "p": total_price}
+            INSERT INTO purchase_items (purchase_id, prod_id, weight, price, purchase_items_date)
+            VALUES (:pid, :prod, :w, :p, COALESCE(:dt, now()))
+            RETURNING purchase_item_id, purchase_id, prod_id, weight, price , purchase_items_date
+        """), {"pid": purchase_id, "prod": body.prod_id, "w": body.weight, "p": total_price ,"dt": body.purchase_items_date,} 
         ).mappings().first()
 
         # write temp → atomic replace
@@ -390,7 +397,7 @@ def update_item_price_only(
         UPDATE purchase_items
            SET price = :p
          WHERE purchase_id=:pid AND purchase_item_id=:iid
-     RETURNING purchase_item_id, purchase_id, prod_id, weight, price
+     RETURNING purchase_item_id, purchase_id, prod_id, weight, price , purchase_items_date
     """), {"pid": purchase_id, "iid": item_id, "p": new_price}
     ).mappings().first()
     db.commit()
