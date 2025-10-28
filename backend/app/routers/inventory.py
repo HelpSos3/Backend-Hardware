@@ -46,31 +46,18 @@ class SellBulkResult(BaseModel):
     ok: bool
     created: List[Dict[str, Any]]
 
-class PurchaseItemRow(BaseModel):
-    purchase_item_id: int
-    purchase_id: int
+class HistoryRow(BaseModel):
     prod_id: int
-    weight: float | None = None
-    price: float | None = None
-    purchase_items_date: datetime | None = None
+    prod_name: Optional[str]
+    weight: float
+    price: Optional[float] = None
+    date: datetime
 
-class PurchaseItemListResponse(BaseModel):
-    items: List[PurchaseItemRow]
+class HistoryListResponse(BaseModel):
+    items: List[HistoryRow]
     page: int
     per_page: int
-    total: int  
-
-class SoldItemRow(BaseModel):
-    stock_sales_id: int
-    prod_id: int
-    weight_sold: float
-    sale_date: datetime
-
-class SoldItemListResponse(BaseModel):
-    items: List[SoldItemRow]
-    page: int
-    per_page: int
-    total: int      
+    total: int    
 
 SortKey = Literal["last_sale_date","-last_sale_date","name","-name","balance","-balance"]
 
@@ -385,8 +372,8 @@ ORDER BY
         headers=headers,
     )
 
-@router.get("/purchased_history/{prod_id}", response_model=PurchaseItemListResponse)
-def get_purchased_history_raw(
+@router.get("/purchased_history_simple/{prod_id}", response_model=HistoryListResponse)
+def get_purchased_history_simple(
     prod_id: int,
     date_from: Optional[datetime] = Query(None, description="เริ่มวันที่ (ISO)"),
     date_to: Optional[datetime] = Query(None, description="สิ้นสุดวันที่ (ISO)"),
@@ -396,36 +383,35 @@ def get_purchased_history_raw(
 ):
     offset = (page - 1) * per_page
 
-    # ทำให้ date_to ครอบคลุมทั้งวัน โดยขยับไปต้นวันถัดไปแล้วใช้ '<'
+    # ทำให้ date_to ครอบคลุมทั้งวันแบบ half-open [from, to)
     from datetime import timedelta
     date_to_exclusive = None
     if date_to is not None:
-        # normalize เป็นต้นวันของ date_to ก่อน
         dt0 = date_to.replace(hour=0, minute=0, second=0, microsecond=0)
         date_to_exclusive = dt0 + timedelta(days=1)
 
     list_sql = text("""
         SELECT
-            purchase_item_id,
-            purchase_id,
-            prod_id,
-            weight,
-            price,
-            purchase_items_date
-        FROM purchase_items
-        WHERE prod_id = :pid
-          AND (:date_from IS NULL OR purchase_items_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR purchase_items_date < :date_to_exclusive)
-        ORDER BY purchase_items_date DESC, purchase_item_id DESC
+          pi.prod_id,
+          p.prod_name,
+          pi.weight,
+          pi.price,
+          pi.purchase_items_date AS date
+        FROM purchase_items pi
+        LEFT JOIN product p ON p.prod_id = pi.prod_id
+        WHERE pi.prod_id = :pid
+          AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
+        ORDER BY pi.purchase_items_date DESC, pi.purchase_item_id DESC
         LIMIT :limit OFFSET :offset
     """)
 
     count_sql = text("""
         SELECT COUNT(*)
-        FROM purchase_items
-        WHERE prod_id = :pid
-          AND (:date_from IS NULL OR purchase_items_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR purchase_items_date < :date_to_exclusive)
+        FROM purchase_items pi
+        WHERE pi.prod_id = :pid
+          AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
     """)
 
     params = {
@@ -440,22 +426,20 @@ def get_purchased_history_raw(
     total = db.execute(count_sql, params).scalar() or 0
 
     items = [
-        PurchaseItemRow(
-            purchase_item_id=r["purchase_item_id"],
-            purchase_id=r["purchase_id"],
+        HistoryRow(
             prod_id=r["prod_id"],
-            weight=float(r["weight"]) if r["weight"] is not None else None,
+            prod_name=r["prod_name"],
+            weight=float(r["weight"]) if r["weight"] is not None else 0.0,
             price=float(r["price"]) if r["price"] is not None else None,
-            purchase_items_date=r["purchase_items_date"],
+            date=r["date"],
         )
         for r in rows
     ]
+    return HistoryListResponse(items=items, page=page, per_page=per_page, total=total)
 
-    return PurchaseItemListResponse(items=items, page=page, per_page=per_page, total=total)
 
-
-@router.get("/sold_history/{prod_id}", response_model=SoldItemListResponse)
-def get_sold_history(
+@router.get("/sold_history_simple/{prod_id}", response_model=HistoryListResponse)
+def get_sold_history_simple(
     prod_id: int,
     date_from: Optional[datetime] = Query(None, description="เริ่มวันที่ (ISO)"),
     date_to: Optional[datetime] = Query(None, description="สิ้นสุดวันที่ (ISO) (รวมทั้งวัน)"),
@@ -463,15 +447,9 @@ def get_sold_history(
     per_page: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """
-    ประวัติการ 'ขายออก' ของสินค้ารายตัว (ดึงจาก stock_sales)
-    - รองรับกรองตามช่วงวันที่ (date_from >=, date_to เป็นแบบรวมทั้งวันด้วยการขยับไปต้นวันถัดไปแล้วใช้ <)
-    - เรียงจากล่าสุดไปเก่าสุด
-    - มี pagination
-    """
     offset = (page - 1) * per_page
 
-    # ทำให้ date_to ครอบคลุมทั้งวัน (half-open interval)
+    # ทำให้ date_to ครอบคลุมทั้งวันแบบ half-open [from, to)
     from datetime import timedelta
     date_to_exclusive = None
     if date_to is not None:
@@ -480,24 +458,26 @@ def get_sold_history(
 
     list_sql = text("""
         SELECT
-            stock_sales_id,
-            prod_id,
-            weight_sold,
-            sale_date
-        FROM stock_sales
-        WHERE prod_id = :pid
-          AND (:date_from IS NULL OR sale_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR sale_date < :date_to_exclusive)
-        ORDER BY sale_date DESC, stock_sales_id DESC
+          ss.prod_id,
+          p.prod_name,
+          ss.weight_sold AS weight,
+          NULL::numeric   AS price,  -- ถ้ามีราคาใน stock_sales เปลี่ยนตรงนี้
+          ss.sale_date    AS date
+        FROM stock_sales ss
+        LEFT JOIN product p ON p.prod_id = ss.prod_id
+        WHERE ss.prod_id = :pid
+          AND (:date_from IS NULL OR ss.sale_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR ss.sale_date < :date_to_exclusive)
+        ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
         LIMIT :limit OFFSET :offset
     """)
 
     count_sql = text("""
         SELECT COUNT(*)
-        FROM stock_sales
-        WHERE prod_id = :pid
-          AND (:date_from IS NULL OR sale_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR sale_date < :date_to_exclusive)
+        FROM stock_sales ss
+        WHERE ss.prod_id = :pid
+          AND (:date_from IS NULL OR ss.sale_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR ss.sale_date < :date_to_exclusive)
     """)
 
     params = {
@@ -512,13 +492,13 @@ def get_sold_history(
     total = db.execute(count_sql, params).scalar() or 0
 
     items = [
-        SoldItemRow(
-            stock_sales_id=r["stock_sales_id"],
+        HistoryRow(
             prod_id=r["prod_id"],
-            weight_sold=float(r["weight_sold"]),
-            sale_date=r["sale_date"],
+            prod_name=r["prod_name"],
+            weight=float(r["weight"]),
+            price=None,  # ถ้ามีคอลัมน์ราคา ให้ map เป็น float(...) ได้เลย
+            date=r["date"],
         )
         for r in rows
     ]
-
-    return SoldItemListResponse(items=items, page=page, per_page=per_page, total=total)
+    return HistoryListResponse(items=items, page=page, per_page=per_page, total=total)
