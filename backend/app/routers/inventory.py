@@ -58,7 +58,19 @@ class PurchaseItemListResponse(BaseModel):
     items: List[PurchaseItemRow]
     page: int
     per_page: int
-    total: int    
+    total: int  
+
+class SoldItemRow(BaseModel):
+    stock_sales_id: int
+    prod_id: int
+    weight_sold: float
+    sale_date: datetime
+
+class SoldItemListResponse(BaseModel):
+    items: List[SoldItemRow]
+    page: int
+    per_page: int
+    total: int      
 
 SortKey = Literal["last_sale_date","-last_sale_date","name","-name","balance","-balance"]
 
@@ -295,7 +307,7 @@ SELECT
 FROM product p
 LEFT JOIN product_categories pc ON pc.category_id = p.category_id
 LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
+JOIN agg_latest al ON al.prod_id = p.prod_id
 WHERE (:only_active = FALSE OR p.is_active = TRUE)
   AND (:category_id IS NULL OR p.category_id = :category_id)
   AND (
@@ -384,6 +396,14 @@ def get_purchased_history_raw(
 ):
     offset = (page - 1) * per_page
 
+    # ทำให้ date_to ครอบคลุมทั้งวัน โดยขยับไปต้นวันถัดไปแล้วใช้ '<'
+    from datetime import timedelta
+    date_to_exclusive = None
+    if date_to is not None:
+        # normalize เป็นต้นวันของ date_to ก่อน
+        dt0 = date_to.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to_exclusive = dt0 + timedelta(days=1)
+
     list_sql = text("""
         SELECT
             purchase_item_id,
@@ -395,7 +415,7 @@ def get_purchased_history_raw(
         FROM purchase_items
         WHERE prod_id = :pid
           AND (:date_from IS NULL OR purchase_items_date >= :date_from)
-          AND (:date_to   IS NULL OR purchase_items_date <= :date_to)
+          AND (:date_to_exclusive IS NULL OR purchase_items_date < :date_to_exclusive)
         ORDER BY purchase_items_date DESC, purchase_item_id DESC
         LIMIT :limit OFFSET :offset
     """)
@@ -405,13 +425,13 @@ def get_purchased_history_raw(
         FROM purchase_items
         WHERE prod_id = :pid
           AND (:date_from IS NULL OR purchase_items_date >= :date_from)
-          AND (:date_to   IS NULL OR purchase_items_date <= :date_to)
+          AND (:date_to_exclusive IS NULL OR purchase_items_date < :date_to_exclusive)
     """)
 
     params = {
         "pid": prod_id,
         "date_from": date_from,
-        "date_to": date_to,
+        "date_to_exclusive": date_to_exclusive,
         "limit": per_page,
         "offset": offset,
     }
@@ -431,6 +451,74 @@ def get_purchased_history_raw(
         for r in rows
     ]
 
-    return PurchaseItemListResponse(
-        items=items, page=page, per_page=per_page, total=total
-    )
+    return PurchaseItemListResponse(items=items, page=page, per_page=per_page, total=total)
+
+
+@router.get("/sold_history/{prod_id}", response_model=SoldItemListResponse)
+def get_sold_history(
+    prod_id: int,
+    date_from: Optional[datetime] = Query(None, description="เริ่มวันที่ (ISO)"),
+    date_to: Optional[datetime] = Query(None, description="สิ้นสุดวันที่ (ISO) (รวมทั้งวัน)"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    ประวัติการ 'ขายออก' ของสินค้ารายตัว (ดึงจาก stock_sales)
+    - รองรับกรองตามช่วงวันที่ (date_from >=, date_to เป็นแบบรวมทั้งวันด้วยการขยับไปต้นวันถัดไปแล้วใช้ <)
+    - เรียงจากล่าสุดไปเก่าสุด
+    - มี pagination
+    """
+    offset = (page - 1) * per_page
+
+    # ทำให้ date_to ครอบคลุมทั้งวัน (half-open interval)
+    from datetime import timedelta
+    date_to_exclusive = None
+    if date_to is not None:
+        dt0 = date_to.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to_exclusive = dt0 + timedelta(days=1)
+
+    list_sql = text("""
+        SELECT
+            stock_sales_id,
+            prod_id,
+            weight_sold,
+            sale_date
+        FROM stock_sales
+        WHERE prod_id = :pid
+          AND (:date_from IS NULL OR sale_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR sale_date < :date_to_exclusive)
+        ORDER BY sale_date DESC, stock_sales_id DESC
+        LIMIT :limit OFFSET :offset
+    """)
+
+    count_sql = text("""
+        SELECT COUNT(*)
+        FROM stock_sales
+        WHERE prod_id = :pid
+          AND (:date_from IS NULL OR sale_date >= :date_from)
+          AND (:date_to_exclusive IS NULL OR sale_date < :date_to_exclusive)
+    """)
+
+    params = {
+        "pid": prod_id,
+        "date_from": date_from,
+        "date_to_exclusive": date_to_exclusive,
+        "limit": per_page,
+        "offset": offset,
+    }
+
+    rows = db.execute(list_sql, params).mappings().all()
+    total = db.execute(count_sql, params).scalar() or 0
+
+    items = [
+        SoldItemRow(
+            stock_sales_id=r["stock_sales_id"],
+            prod_id=r["prod_id"],
+            weight_sold=float(r["weight_sold"]),
+            sale_date=r["sale_date"],
+        )
+        for r in rows
+    ]
+
+    return SoldItemListResponse(items=items, page=page, per_page=per_page, total=total)
