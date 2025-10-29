@@ -40,7 +40,7 @@ class InventoryListResponse(BaseModel):
 class SellLine(BaseModel):
     prod_id: int = Field(..., ge=1)
     weight_sold: float = Field(..., gt=0)
-    note: Optional[str] = None  # เผื่ออนาคต ถ้าจะเพิ่มคอลัมน์หมายเหตุใน stock_sales
+    note: Optional[str] = None  
 
 class SellBulkResult(BaseModel):
     ok: bool
@@ -461,7 +461,6 @@ def get_sold_history_simple(
           ss.prod_id,
           p.prod_name,
           ss.weight_sold AS weight,
-          NULL::numeric   AS price,  -- ถ้ามีราคาใน stock_sales เปลี่ยนตรงนี้
           ss.sale_date    AS date
         FROM stock_sales ss
         LEFT JOIN product p ON p.prod_id = ss.prod_id
@@ -496,7 +495,6 @@ def get_sold_history_simple(
             prod_id=r["prod_id"],
             prod_name=r["prod_name"],
             weight=float(r["weight"]),
-            price=None,  # ถ้ามีคอลัมน์ราคา ให้ map เป็น float(...) ได้เลย
             date=r["date"],
         )
         for r in rows
