@@ -20,6 +20,26 @@ def get_db():
     finally:
         db.close()
 
+def _parse_prod_ids_csv(s: Optional[str]) -> Optional[List[int]]:
+    if not s:
+        return None
+    ids = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok:
+            try:
+                ids.append(int(tok))
+            except ValueError:
+                pass
+    return ids or None
+
+def _make_date_to_exclusive(date_to: Optional[datetime]) -> Optional[datetime]:
+    if not date_to:
+        return None
+    from datetime import timedelta
+    dt0 = date_to.replace(hour=0, minute=0, second=0, microsecond=0)
+    return dt0 + timedelta(days=1)
+
 # ----------- Models -----------
 class InventoryItem(BaseModel):
     prod_id: int
@@ -261,7 +281,6 @@ def export_inventory_excel(
     sort: SortKey = Query("-last_sale_date"),
     db: Session = Depends(get_db),
 ):
-    # --- Query เดิม ---
     sql = """
 WITH latest_sale AS (
   SELECT
@@ -277,7 +296,7 @@ WITH latest_sale AS (
 agg_latest AS (
   SELECT
     prod_id,
-    sale_date  AS last_sale_date,
+    sale_date   AS last_sale_date,
     weight_sold AS last_sold_qty
   FROM latest_sale
   WHERE rn = 1
@@ -294,7 +313,7 @@ SELECT
 FROM product p
 LEFT JOIN product_categories pc ON pc.category_id = p.category_id
 LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-JOIN agg_latest al ON al.prod_id = p.prod_id
+LEFT JOIN agg_latest al ON al.prod_id = p.prod_id      -- << เปลี่ยนจาก JOIN เป็น LEFT JOIN
 WHERE (:only_active = FALSE OR p.is_active = TRUE)
   AND (:category_id IS NULL OR p.category_id = :category_id)
   AND (
@@ -304,15 +323,14 @@ WHERE (:only_active = FALSE OR p.is_active = TRUE)
     OR  p.prod_id::text = :q
   )
 ORDER BY
-  CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC,
-  CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC,
+  CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC NULLS LAST,
+  CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC  NULLS FIRST,
   CASE WHEN :sort='-balance'        THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END DESC,
   CASE WHEN :sort='balance'         THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END ASC,
   CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
   CASE WHEN :sort='name'            THEN p.prod_name END ASC,
   p.prod_id ASC
 """
-
     rows = db.execute(text(sql), {
         "category_id": category_id,
         "q": q,
@@ -320,16 +338,13 @@ ORDER BY
         "sort": sort
     }).mappings().all()
 
-    # --- สร้างไฟล์ Excel ด้วย openpyxl ---
     wb = Workbook()
     ws = wb.active
     ws.title = "รายงานคลังสินค้า"
 
-    # Header
     headers = ["รหัส", "ชื่อสินค้า", "หมวดหมู่", "คงเหลือ (kg)", "วันที่ขายล่าสุด", "จำนวนที่ขายล่าสุด (kg)"]
     ws.append(headers)
 
-    # Data
     for r in rows:
         prod_code = f'#{str(r["prod_id"]).zfill(3)}'
         last_date = r["last_sale_date"].strftime("%Y-%m-%d %H:%M") if r["last_sale_date"] else ""
@@ -342,29 +357,15 @@ ORDER BY
             float(r["last_sold_qty"]) if r["last_sold_qty"] is not None else ""
         ])
 
-    # --- ปรับขนาดคอลัมน์ให้อ่านง่าย ---
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                max_length = max(max_length, len(str(cell.value)))
-            except:
-                pass
-        ws.column_dimensions[column].width = max_length + 2
-
-    # --- ส่งออกเป็นไฟล์ Excel ---
+    from io import BytesIO
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    # ชื่อไฟล์รองรับภาษาไทย
+    from urllib.parse import quote
     filename = "รายงานคลังสินค้า.xlsx"
     encoded_name = quote(filename)
-
-    headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"
-    }
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
 
     return StreamingResponse(
         output,
@@ -500,3 +501,190 @@ def get_sold_history_simple(
         for r in rows
     ]
     return HistoryListResponse(items=items, page=page, per_page=per_page, total=total)
+
+@router.get("/export_purchased")
+def export_purchased_excel(
+    prod_ids: Optional[str] = Query(None, description="เช่น 1,2,5 ไม่ส่ง = ทุกสินค้า"),
+    category_id: Optional[int] = Query(None),
+    q: Optional[str] = Query(None),
+    only_active: bool = Query(True),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+):
+    ids_list = _parse_prod_ids_csv(prod_ids)
+    date_to_exclusive = _make_date_to_exclusive(date_to)
+
+    sql = text("""
+WITH filtered_product AS (
+  SELECT p.prod_id, p.prod_name, p.prod_img, p.category_id
+  FROM product p
+  WHERE (:only_active = FALSE OR p.is_active = TRUE)
+    AND (:category_id IS NULL OR p.category_id = :category_id)
+    AND (
+         :q IS NULL OR :q = ''
+      OR  p.prod_name ILIKE '%'||:q||'%'
+      OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+      OR  p.prod_id::text = :q
+    )
+    AND (:ids_is_null OR p.prod_id = ANY(:ids))
+)
+SELECT
+  fp.prod_id,
+  fp.prod_name,
+  pc.category_name,
+  pi.weight,
+  pi.price,
+  pi.purchase_items_date AS dt
+FROM purchase_items pi
+JOIN filtered_product fp ON fp.prod_id = pi.prod_id
+LEFT JOIN product_categories pc ON pc.category_id = fp.category_id
+WHERE (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+  AND (:date_to_ex IS NULL OR pi.purchase_items_date < :date_to_ex)
+ORDER BY pi.purchase_items_date DESC, pi.purchase_item_id DESC
+""")
+
+    rows = db.execute(sql, {
+        "only_active": only_active,
+        "category_id": category_id,
+        "q": q,
+        "ids_is_null": ids_list is None,
+        "ids": ids_list or [],
+        "date_from": date_from,
+        "date_to_ex": date_to_exclusive,
+    }).mappings().all()
+
+    # สร้าง Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "รับซื้อทั้งหมด"
+
+    headers = ["รหัส", "ชื่อสินค้า", "หมวดหมู่", "น้ำหนัก (kg)", "ราคา", "วันที่รับซื้อ"]
+    ws.append(headers)
+
+    for r in rows:
+        prod_code = f'#{str(r["prod_id"]).zfill(3)}'
+        dt = r["dt"].strftime("%Y-%m-%d %H:%M") if r["dt"] else ""
+        ws.append([
+            prod_code,
+            r["prod_name"] or "",
+            r["category_name"] or "",
+            float(r["weight"]) if r["weight"] is not None else 0.0,
+            float(r["price"]) if r["price"] is not None else "",
+            dt
+        ])
+
+    # ปรับความกว้างคอลัมน์
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            max_len = max(max_len, len(str(cell.value)) if cell.value is not None else 0)
+        ws.column_dimensions[col_letter].width = max_len + 2
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = "รายงานรับซื้อทั้งหมด.xlsx"
+    encoded_name = quote(filename)
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+# ----------- GET /inventory/export_sold -----------
+@router.get("/export_sold")
+def export_sold_excel(
+    prod_ids: Optional[str] = Query(None, description="เช่น 1,2,5 ไม่ส่ง = ทุกสินค้า"),
+    category_id: Optional[int] = Query(None),
+    q: Optional[str] = Query(None),
+    only_active: bool = Query(True),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db),
+):
+    ids_list = _parse_prod_ids_csv(prod_ids)
+    date_to_exclusive = _make_date_to_exclusive(date_to)
+
+    sql = text("""
+WITH filtered_product AS (
+  SELECT p.prod_id, p.prod_name, p.prod_img, p.category_id
+  FROM product p
+  WHERE (:only_active = FALSE OR p.is_active = TRUE)
+    AND (:category_id IS NULL OR p.category_id = :category_id)
+    AND (
+         :q IS NULL OR :q = ''
+      OR  p.prod_name ILIKE '%'||:q||'%'
+      OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+      OR  p.prod_id::text = :q
+    )
+    AND (:ids_is_null OR p.prod_id = ANY(:ids))
+)
+SELECT
+  fp.prod_id,
+  fp.prod_name,
+  pc.category_name,
+  ss.weight_sold AS weight,
+  ss.sale_date   AS dt
+FROM stock_sales ss
+JOIN filtered_product fp ON fp.prod_id = ss.prod_id
+LEFT JOIN product_categories pc ON pc.category_id = fp.category_id
+WHERE (:date_from IS NULL OR ss.sale_date >= :date_from)
+  AND (:date_to_ex IS NULL OR ss.sale_date < :date_to_ex)
+ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
+""")
+
+    rows = db.execute(sql, {
+        "only_active": only_active,
+        "category_id": category_id,
+        "q": q,
+        "ids_is_null": ids_list is None,
+        "ids": ids_list or [],
+        "date_from": date_from,
+        "date_to_ex": date_to_exclusive,
+    }).mappings().all()
+
+    # สร้าง Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ขายออกทั้งหมด"
+
+    headers = ["รหัส", "ชื่อสินค้า", "หมวดหมู่", "น้ำหนักที่ขาย (kg)", "วันที่ขาย"]
+    ws.append(headers)
+
+    for r in rows:
+        prod_code = f'#{str(r["prod_id"]).zfill(3)}'
+        dt = r["dt"].strftime("%Y-%m-%d %H:%M") if r["dt"] else ""
+        ws.append([
+            prod_code,
+            r["prod_name"] or "",
+            r["category_name"] or "",
+            float(r["weight"]) if r["weight"] is not None else 0.0,
+            dt
+        ])
+
+    # ปรับความกว้างคอลัมน์
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            max_len = max(max_len, len(str(cell.value)) if cell.value is not None else 0)
+        ws.column_dimensions[col_letter].width = max_len + 2
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = "รายงานขายออกทั้งหมด.xlsx"
+    encoded_name = quote(filename)
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
