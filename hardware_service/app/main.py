@@ -1,5 +1,6 @@
 from fastapi import FastAPI
-from .routers import idcard , camera , printer
+from .routers import idcard , camera , printer, scale
+
 
 app = FastAPI(title="Hardware API (Thai ID card)")
 
@@ -7,6 +8,7 @@ app = FastAPI(title="Hardware API (Thai ID card)")
 app.include_router(idcard.router, prefix="/idcard", tags=["idcard"])
 app.include_router(camera.router)
 app.include_router(printer.router)
+app.include_router(scale.router)
 
 
 @app.get("/")
