@@ -1,23 +1,47 @@
+# ---------------------------
 # Python
+# ---------------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.sqlite3
 
-# VSCode / IDE
-.vscode/
-.idea/
+# Virtual Environments
+venv/
+.env/
+*.env
+hardware_service/.venv/
+backend/.venv/
 
-# Docker
-*.log
-db_data/
-uploads/
-
-
-# OS
+# ---------------------------
+# OS files
+# ---------------------------
 .DS_Store
 Thumbs.db
 
+# ---------------------------
+# VSCode / IDE
+# ---------------------------
+.vscode/
+.idea/
 
-hardware_service/.venv/
+# ---------------------------
+# Docker & Logs
+# ---------------------------
+*.log
+db_data/
+uploads/
+docker-data/
+docker-compose.override.yml
+
+# ---------------------------
+# Node (ในกรณีมี frontend)
+# ---------------------------
+node_modules/
+
+# ---------------------------
+# Temporary
+# ---------------------------
+*.tmp
+*.temp
