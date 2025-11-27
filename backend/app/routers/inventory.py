@@ -12,6 +12,9 @@ from openpyxl import Workbook
 from urllib.parse import quote
 router = APIRouter(prefix="/inventory", tags=["inventory"])
 
+
+
+
 # ----------- DB Session -----------
 def get_db():
     db = SessionLocal()
@@ -20,6 +23,7 @@ def get_db():
     finally:
         db.close()
 
+# เลือกสินค้าที่ต้องการ ตอนExport แยก, ตัดช่องว่าง แปลงเป็นint 
 def _parse_prod_ids_csv(s: Optional[str]) -> Optional[List[int]]:
     if not s:
         return None
@@ -33,6 +37,7 @@ def _parse_prod_ids_csv(s: Optional[str]) -> Optional[List[int]]:
                 pass
     return ids or None
 
+# ฟิลเตอร์ช่วงวันให้รวมทั้งวันสุดท้ายแบบไม่ผิดเวลา
 def _make_date_to_exclusive(date_to: Optional[datetime]) -> Optional[datetime]:
     if not date_to:
         return None
@@ -41,6 +46,7 @@ def _make_date_to_exclusive(date_to: Optional[datetime]) -> Optional[datetime]:
     return dt0 + timedelta(days=1)
 
 # ----------- Models -----------
+# รูปแบบข้อมูลของ สินค้า 1 ชิ้นในคลัง
 class InventoryItem(BaseModel):
     prod_id: int
     prod_code: str
@@ -51,21 +57,25 @@ class InventoryItem(BaseModel):
     last_sold_qty: Optional[float] = None
     balance_weight: float = 0.0
 
+# ดึงรายการสินค้าทั้งหมด
 class InventoryListResponse(BaseModel):
     items: List[InventoryItem]
     page: int
     per_page: int
     total: int
 
+# บรรทัดการขาย 1 รายการ
 class SellLine(BaseModel):
     prod_id: int = Field(..., ge=1)
     weight_sold: float = Field(..., gt=0)
     note: Optional[str] = None  
 
+
 class SellBulkResult(BaseModel):
     ok: bool
     created: List[Dict[str, Any]]
 
+# ประวัติการซื้อ หรือ ขาย
 class HistoryRow(BaseModel):
     prod_id: int
     prod_name: Optional[str]
@@ -73,6 +83,7 @@ class HistoryRow(BaseModel):
     price: Optional[float] = None
     date: datetime
 
+# เรียกดูประวัติซื้อ/ขาย
 class HistoryListResponse(BaseModel):
     items: List[HistoryRow]
     page: int
@@ -92,8 +103,9 @@ def list_inventory_items(
     per_page: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    offset = (page - 1) * per_page
-
+    offset = (page - 1) * per_page # เริ่มดึงจากแถวที่เท่าไหร่ 
+    # ตาราง latest_sale ชั่วคราว
+    # rn = rownumber
     sql = text("""
           WITH latest_sale AS (
             SELECT
@@ -125,7 +137,7 @@ def list_inventory_items(
             al.last_sold_qty
           FROM product p
           LEFT JOIN product_categories pc ON pc.category_id = p.category_id
-          JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
+          LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
           LEFT JOIN agg_latest al ON al.prod_id = p.prod_id
           WHERE (:only_active = FALSE OR p.is_active = TRUE)
             AND (:category_id IS NULL OR p.category_id = :category_id)
@@ -149,6 +161,7 @@ def list_inventory_items(
     sql_count = text("""
       SELECT COUNT(*)
       FROM product p
+      LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id               
       WHERE (:only_active = FALSE OR p.is_active = TRUE)
         AND (:category_id IS NULL OR p.category_id = :category_id)
         AND (
@@ -159,15 +172,18 @@ def list_inventory_items(
         )
     """)
 
+
+    # ได้แถวสินค้าของหน้าปัจจุบัน
     rows = db.execute(sql, {
         "category_id": category_id,
         "q": q,
         "only_active": only_active,
         "sort": sort,
-        "limit": per_page,
-        "offset": offset
+        "limit": per_page, #จำนวนแถวที่ต้องการในหน้านี้
+        "offset": offset # เริ่มดึงจากแถวที่เท่าไหร่
     }).mappings().all()
 
+    # จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข
     total = db.execute(sql_count, {
         "category_id": category_id,
         "q": q,
@@ -188,6 +204,13 @@ def list_inventory_items(
         ))
 
     return InventoryListResponse(items=items, page=page, per_page=per_page, total=total)
+    #items = สินค้าในหน้านี้ 
+    # page = หน้าปัจจุบัน 
+    # per_page = ดึงมากี่ตัวต่อหน้า 
+    # total = จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข 
+
+
+
 
 # ----------- POST /stock_sales/bulk -----------
 @router.post("/sell", response_model=SellBulkResult)
@@ -218,7 +241,7 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
             """)
             db.execute(ensure_sql, {"ids": list(prod_ids)})
 
-            # 2) ล็อกแถว totals ที่เกี่ยวข้อง
+            # 2) ล็อกแถว totals ที่เกี่ยวข้อง ป้องกันการขายชนกัน/ขายเกิน เมื่อมีคำสั่งพร้อมกันหลายอัน FOR UPDATE
             lock_sql = text("""
                 SELECT prod_id, purchased_weight, sold_weight
                 FROM product_inventory_totals
@@ -251,7 +274,7 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
                 if qty > balances.get(pid, 0.0):
                     raise HTTPException(status_code=409, detail=f"insufficient balance for product {pid}: {qty} > {balances.get(pid, 0.0)}")
 
-            # 5) แทรกขายออก (trigger จะอัพเดต totals ให้เอง)
+            # 5) แทรกขายออก 
             insert_sql = text("""
                 INSERT INTO stock_sales (prod_id, weight_sold)
                 VALUES (:pid, :qty)
@@ -338,6 +361,7 @@ ORDER BY
         "sort": sort
     }).mappings().all()
 
+    #สร้างไฟล์ Excel ด้วย openpyxl
     wb = Workbook()
     ws = wb.active
     ws.title = "รายงานคลังสินค้า"
@@ -357,16 +381,16 @@ ORDER BY
             float(r["last_sold_qty"]) if r["last_sold_qty"] is not None else ""
         ])
 
-    from io import BytesIO
+    # พื้นที่สำหรับเก็บข้อมูลแบบไฟล์ แต่เก็บ ไว้ใน RAM
     output = BytesIO()
     wb.save(output)
     output.seek(0)
 
-    from urllib.parse import quote
+
     filename = "รายงานคลังสินค้า.xlsx"
     encoded_name = quote(filename)
     headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
-
+    # ส่งไฟล์ให้เบราว์เซอร์ดาวน์โหลด
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

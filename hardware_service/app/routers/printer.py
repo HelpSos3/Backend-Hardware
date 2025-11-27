@@ -418,16 +418,6 @@ def render_receipt_image(data: ReceiptData):
         headers={"Cache-Control": "no-store"}
     )
 
-@router.post("/render_base64")
-def render_receipt_image_base64(data: ReceiptData):
-    """
-    เหมือน /render แต่ห่อเป็น base64 ใน JSON
-    """
-    width_px = _cfg_img_width_px()
-    img = build_receipt_image(data, width_px)
-    jpeg_bytes = _image_to_jpeg_bytes(img)
-    b64 = _b64.b64encode(jpeg_bytes).decode("ascii")
-    return JSONResponse({"image_base64": b64, "mime": "image/jpeg"})
 
 
 
