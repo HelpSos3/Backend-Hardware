@@ -112,8 +112,7 @@ def list_inventory_items(
     db: Session = Depends(get_db),
 ):
     offset = (page - 1) * per_page # เริ่มดึงจากแถวที่เท่าไหร่ 
-    # ตาราง latest_sale ชั่วคราว
-    # rn = rownumber
+
     sql = text("""
           WITH latest_sale AS (
             SELECT
@@ -220,10 +219,6 @@ def list_inventory_items(
     current_page=page,
     per_page=per_page
 )
-
-
-
-
 
 # ----------- POST /stock_sales/bulk -----------
 @router.post("/sell", response_model=SellBulkResult)

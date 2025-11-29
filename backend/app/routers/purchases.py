@@ -70,10 +70,11 @@ class CustomerListItem(BaseModel):
 
 class PaginatedCustomers(BaseModel):
     items: List[CustomerListItem]
-    total: int
-    page: int
-    page_size: int
+    total_items: int
     total_pages: int
+    current_page: int
+    per_page: int
+
 
 class CommitIdCardIn(BaseModel):
     full_name: Optional[str] = None
@@ -547,8 +548,6 @@ def list_customers(
     page_size: int = Query(20, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    # ---------------------------
-    # เพิ่มเงื่อนไข: ต้องมีชื่อจริง (กัน NULL และว่าง)
     where = "c.full_name IS NOT NULL AND c.full_name <> ''"
     params = {}
 
@@ -556,14 +555,19 @@ def list_customers(
         where += " AND (c.full_name ILIKE :kw OR c.address ILIKE :kw)"
         params["kw"] = f"%{q.strip()}%"
 
-    # ---------------------------
     total = db.execute(
         text(f"SELECT COUNT(*) AS n FROM customers c WHERE {where}"),
         params
     ).scalar_one()
 
     if total == 0:
-        return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 0}
+        return {
+            "items": [],
+            "total_items": 0,
+            "total_pages": 0,
+            "current_page": page,
+            "per_page": page_size,
+        }
 
     offset = (page - 1) * page_size
 
@@ -593,11 +597,12 @@ def list_customers(
 
     return {
         "items": rows,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
+        "total_items": total,
         "total_pages": math.ceil(total / page_size),
+        "current_page": page,
+        "per_page": page_size,
     }
+
 
 
 def _safe_abs_from_imgpath(img_path: str) -> str:
