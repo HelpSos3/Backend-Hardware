@@ -60,9 +60,10 @@ class InventoryItem(BaseModel):
 # ดึงรายการสินค้าทั้งหมด
 class InventoryListResponse(BaseModel):
     items: List[InventoryItem]
-    page: int
+    total_items: int
+    total_pages: int
+    current_page: int
     per_page: int
-    total: int
 
 # บรรทัดการขาย 1 รายการ
 class SellLine(BaseModel):
@@ -86,9 +87,16 @@ class HistoryRow(BaseModel):
 # เรียกดูประวัติซื้อ/ขาย
 class HistoryListResponse(BaseModel):
     items: List[HistoryRow]
-    page: int
-    per_page: int
-    total: int    
+    total_items: int
+    total_pages: int
+    current_page: int
+    per_page: int  
+
+#items คือ รายการข้อมูลในหน้านั้น
+#total_items คือ จำนวนข้อมูลทั้งหมด
+#total_pages คือ จำนวนหน้าทั้งหมด
+#current_page คือ หน้าในปัจจุบันที่ผู้ใช้กำลังเปิดอยู่ 
+#per_page คือ จำนวนข้อมูลที่ต้องการใน 1 หน้า
 
 SortKey = Literal["last_sale_date","-last_sale_date","name","-name","balance","-balance"]
 
@@ -203,11 +211,16 @@ def list_inventory_items(
             balance_weight=float(r["balance_weight"]) if r["balance_weight"] is not None else 0.0
         ))
 
-    return InventoryListResponse(items=items, page=page, per_page=per_page, total=total)
-    #items = สินค้าในหน้านี้ 
-    # page = หน้าปัจจุบัน 
-    # per_page = ดึงมากี่ตัวต่อหน้า 
-    # total = จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข 
+    total_pages = (total + per_page - 1) // per_page
+
+    return InventoryListResponse(
+    items=items,
+    total_items=total,
+    total_pages=total_pages,
+    current_page=page,
+    per_page=per_page
+)
+
 
 
 
@@ -460,7 +473,15 @@ def get_purchased_history_simple(
         )
         for r in rows
     ]
-    return HistoryListResponse(items=items, page=page, per_page=per_page, total=total)
+    total_pages = (total + per_page - 1) // per_page
+
+    return HistoryListResponse(
+    items=items,
+    total_items=total,
+    total_pages=total_pages,
+    current_page=page,
+    per_page=per_page
+)
 
 
 @router.get("/sold_history_simple/{prod_id}", response_model=HistoryListResponse)
@@ -524,7 +545,15 @@ def get_sold_history_simple(
         )
         for r in rows
     ]
-    return HistoryListResponse(items=items, page=page, per_page=per_page, total=total)
+    total_pages = (total + per_page - 1) // per_page
+
+    return HistoryListResponse(
+    items=items,
+    total_items=total,
+    total_pages=total_pages,
+    current_page=page,
+    per_page=per_page
+)
 
 @router.get("/export_purchased")
 def export_purchased_excel(

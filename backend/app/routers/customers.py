@@ -34,8 +34,21 @@ class CustomerItem(BaseModel):
     payment_method: str
     category_name: str
 
+class CustomerListResponse(BaseModel):
+    items: List[CustomerList]
+    total_items: int
+    total_pages: int
+    current_page: int
+    per_page: int
 
-@router.get("/", response_model=List[CustomerList])
+class CustomerItemResponse(BaseModel):
+    items: List[CustomerItem]
+    total_items: int
+    total_pages: int
+    current_page: int
+    per_page: int
+
+@router.get("/", response_model=CustomerListResponse)
 def list_customers(
     q:str | None = Query(None),
     page: int = Query(1, ge=1),
@@ -43,29 +56,50 @@ def list_customers(
     db: Session = Depends(get_db)
 ):
     offset = (page - 1) * per_page
-    sql = text("""
-            SELECT
-               c.customer_id,
-               c.full_name,
-               c.address,
-               cp.photo_path as photo,
-               (
-               SELECT MAX(purchase_date)
-               FROM purchases p
-               WHERE p.customer_id = c.customer_id
-               ) AS last_purchase_date
-            FROM customers c
-            LEFT JOIN customer_photos cp on cp.customer_id = c.customer_id
+
+    # จำนวนลูกค้าทั้งหมดที่มี
+    count_sql = text("""
+            SELECT COUNT(*)
+            FROM customers c 
             WHERE (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
-            ORDER BY last_purchase_date DESC nulls LAST
+
+""")
+    
+    total_items = db.execute(count_sql, {"q": q}).scalar_one()
+    sql = text("""
+                SELECT
+                    c.customer_id,
+                    c.full_name,
+                    c.address,
+                    cp.photo_path AS photo,
+                (
+                    SELECT TO_CHAR(MAX(p.purchase_date), 'DD/MM/YYYY HH24:MI')
+                    FROM purchases p
+                    WHERE p.customer_id = c.customer_id
+                ) AS last_purchase_date
+            FROM customers c
+            LEFT JOIN customer_photos cp ON cp.customer_id = c.customer_id
+            WHERE (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
+            ORDER BY 
+                c.full_name NULLS LAST,
+                c.customer_id ASC
             LIMIT :per_page
-            OFFSET :offset
-            ;
+            OFFSET :offset;
 """)
     rows = db.execute(sql,{"q":q, "per_page":per_page, "offset":offset}).mappings().all()
-    return rows
 
-@router.get("/{customer_id}",response_model=List[CustomerItem])
+    total_pages = (total_items + per_page - 1) // per_page
+
+    return CustomerListResponse(
+    items=rows,
+    total_items=total_items,
+    total_pages=total_pages,
+    current_page=page,
+    per_page=per_page
+)
+
+
+@router.get("/{customer_id}",response_model=CustomerItemResponse)
 def list_items(
     customer_id: int ,
     page: int = Query(1, ge=1),
@@ -74,6 +108,14 @@ def list_items(
 
     offset = (page - 1) * per_page
 
+    count_sql = text("""
+    SELECT COUNT(*)
+    FROM purchases pu
+    JOIN purchase_items pi ON pu.purchase_id = pi.purchase_id
+    WHERE pu.customer_id = :customer_id
+""")
+    
+    total_items = db.execute(count_sql,{"customer_id":customer_id}).scalar_one()
     sql = text("""
             SELECT
                 c.customer_id,
@@ -94,9 +136,17 @@ def list_items(
             join product_categories cat on cat.category_id = pr.category_id 	
             join payment pay on pay.purchase_id = pu.purchase_id
             where pu.customer_id = :customer_id
-            ORDER BY pu.purchase_date DESC
+            ORDER BY pi.purchase_items_date DESC
             LIMIT :per_page
             OFFSET :offset   ;
 """)
     rows = db.execute(sql,{"customer_id": customer_id,"per_page":per_page,"offset":offset}).mappings().all()
-    return rows
+
+    total_pages =  (total_items + per_page -1) // per_page
+    return CustomerItemResponse  (  
+                        items=rows,
+                        total_items=total_items,
+                        total_pages=total_pages,
+                        current_page=page,
+                        per_page=per_page
+                )
