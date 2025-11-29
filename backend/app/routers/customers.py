@@ -38,8 +38,11 @@ class CustomerItem(BaseModel):
 @router.get("/", response_model=List[CustomerList])
 def list_customers(
     q:str | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1 , le=200),
     db: Session = Depends(get_db)
 ):
+    offset = (page - 1) * per_page
     sql = text("""
             SELECT
                c.customer_id,
@@ -55,13 +58,22 @@ def list_customers(
             LEFT JOIN customer_photos cp on cp.customer_id = c.customer_id
             WHERE (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
             ORDER BY last_purchase_date DESC nulls LAST
+            LIMIT :per_page
+            OFFSET :offset
             ;
 """)
-    rows = db.execute(sql,{"q":q}).mappings().all()
+    rows = db.execute(sql,{"q":q, "per_page":per_page, "offset":offset}).mappings().all()
     return rows
 
 @router.get("/{customer_id}",response_model=List[CustomerItem])
-def list_items(customer_id: int , db:Session = Depends(get_db)):
+def list_items(
+    customer_id: int ,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=200), 
+    db:Session = Depends(get_db)):
+
+    offset = (page - 1) * per_page
+
     sql = text("""
             SELECT
                 c.customer_id,
@@ -82,7 +94,9 @@ def list_items(customer_id: int , db:Session = Depends(get_db)):
             join product_categories cat on cat.category_id = pr.category_id 	
             join payment pay on pay.purchase_id = pu.purchase_id
             where pu.customer_id = :customer_id
-            ORDER BY pu.purchase_date DESC;
+            ORDER BY pu.purchase_date DESC
+            LIMIT :per_page
+            OFFSET :offset   ;
 """)
-    rows = db.execute(sql,{"customer_id": customer_id}).mappings().all()
+    rows = db.execute(sql,{"customer_id": customer_id,"per_page":per_page,"offset":offset}).mappings().all()
     return rows
