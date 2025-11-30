@@ -113,6 +113,22 @@ def list_inventory_items(
 ):
     offset = (page - 1) * per_page # เริ่มดึงจากแถวที่เท่าไหร่ 
 
+    sql_count = text("""
+      SELECT COUNT(*)
+      FROM product p
+      LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id               
+      WHERE (:only_active = FALSE OR p.is_active = TRUE)
+        AND (:category_id IS NULL OR p.category_id = :category_id)
+        AND (
+             :q IS NULL OR :q = ''
+          OR  p.prod_name ILIKE '%'||:q||'%'
+          OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+          OR  p.prod_id::text = :q
+        )
+    """)
+        # จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข
+    total = db.execute(sql_count, {"category_id": category_id,"q": q,"only_active": only_active}).scalar() or 0
+
     sql = text("""
           WITH latest_sale AS (
             SELECT
@@ -165,21 +181,6 @@ def list_inventory_items(
           LIMIT :limit OFFSET :offset;
           """)
 
-    sql_count = text("""
-      SELECT COUNT(*)
-      FROM product p
-      LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id               
-      WHERE (:only_active = FALSE OR p.is_active = TRUE)
-        AND (:category_id IS NULL OR p.category_id = :category_id)
-        AND (
-             :q IS NULL OR :q = ''
-          OR  p.prod_name ILIKE '%'||:q||'%'
-          OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
-          OR  p.prod_id::text = :q
-        )
-    """)
-
-
     # ได้แถวสินค้าของหน้าปัจจุบัน
     rows = db.execute(sql, {
         "category_id": category_id,
@@ -190,12 +191,6 @@ def list_inventory_items(
         "offset": offset # เริ่มดึงจากแถวที่เท่าไหร่
     }).mappings().all()
 
-    # จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข
-    total = db.execute(sql_count, {
-        "category_id": category_id,
-        "q": q,
-        "only_active": only_active
-    }).scalar() or 0
 
     items: List[InventoryItem] = []
     for r in rows:
