@@ -48,6 +48,12 @@ class CustomerItemResponse(BaseModel):
     current_page: int
     per_page: int
 
+#items คือ รายการข้อมูลในหน้านั้น
+#total_items คือ จำนวนข้อมูลทั้งหมด
+#total_pages คือ จำนวนหน้าทั้งหมด
+#current_page คือ หน้าในปัจจุบันที่ผู้ใช้กำลังเปิดอยู่ 
+#per_page คือ จำนวนข้อมูลที่ต้องการใน 1 หน้า
+
 @router.get("/", response_model=CustomerListResponse)
 def list_customers(
     q:str | None = Query(None),
@@ -64,8 +70,8 @@ def list_customers(
             WHERE (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
 
 """)
-    
     total_items = db.execute(count_sql, {"q": q}).scalar_one()
+    
     sql = text("""
                 SELECT
                     c.customer_id,

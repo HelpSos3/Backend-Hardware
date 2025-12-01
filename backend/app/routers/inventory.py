@@ -128,7 +128,8 @@ def list_inventory_items(
     """)
         # จำนวนสินค้าทั้งหมดที่เข้าเงื่อนไข
     total = db.execute(sql_count, {"category_id": category_id,"q": q,"only_active": only_active}).scalar() or 0
-
+        #CTE 1: latest_sale PARTITION ช่วยแยกข้อมูลเป็นกลุ่ม
+        #CTE 2: agg_latest ดึงเฉพาะข้อมูลล่าสุดของแต่ละสินค้า
     sql = text("""
           WITH latest_sale AS (
             SELECT
@@ -233,40 +234,35 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
             if missing:
                 raise HTTPException(status_code=404, detail=f"product not found: {sorted(missing)}")
 
-            # 1) ensure totals row (กรณีมีสินค้าที่เพิ่งสร้างแต่ยังไม่เคยมีการซื้อ/ขาย)
-            ensure_sql = text("""
-                INSERT INTO product_inventory_totals (prod_id, purchased_weight, sold_weight)
-                SELECT p.prod_id, 0, 0
-                FROM product p
-                LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-                WHERE p.prod_id = ANY(:ids) AND pit.prod_id IS NULL
-                ON CONFLICT (prod_id) DO NOTHING
-            """)
-            db.execute(ensure_sql, {"ids": list(prod_ids)})
-
-            # 2) ล็อกแถว totals ที่เกี่ยวข้อง ป้องกันการขายชนกัน/ขายเกิน เมื่อมีคำสั่งพร้อมกันหลายอัน FOR UPDATE
-            lock_sql = text("""
-                SELECT prod_id, purchased_weight, sold_weight
+            # 1) ตรวจว่าสินค้านี้มีสต็อก (เคยรับเข้ามา) หรือยัง
+            check_totals_sql = text("""
+                SELECT prod_id
                 FROM product_inventory_totals
                 WHERE prod_id = ANY(:ids)
-                FOR UPDATE
             """)
-            db.execute(lock_sql, {"ids": list(prod_ids)})
+            
+            exist_totals = {r["prod_id"] for r in db.execute(check_totals_sql, {"ids": list(prod_ids)}).mappings().all()}
 
-            # 3) อ่านคงเหลือแบบคำนวณ (ภายใต้ FOR UPDATE)
+            missing_totals = prod_ids - exist_totals
+            if missing_totals:
+                raise HTTPException(
+                status_code=400,
+                detail=f"สินค้าบางรายการยังไม่เคยรับซื้อมาก่อน จึงไม่สามารถขายได้: {sorted(missing_totals)}"
+            )
+
+            # 2) อ่านคงเหลือแบบคำนวณ 
             cur_sql = text("""
                 SELECT pit.prod_id,
                        (COALESCE(pit.purchased_weight,0) - COALESCE(pit.sold_weight,0)) AS balance_weight
                 FROM product_inventory_totals pit
                 WHERE pit.prod_id = ANY(:ids)
-                FOR UPDATE
             """)
             balances = {
                 r["prod_id"]: float(r["balance_weight"])
-                for r in db.execute(cur_sql, {"ids": list(prod_ids)}).mappings().all()
+                for r in db.execute(cur_sql, {"ids": list(exist_totals)}).mappings().all()
             }
 
-            # 4) รวมยอด/ตรวจไม่ให้ติดลบ
+            # 3) รวมยอด/ตรวจไม่ให้ติดลบ
             aggregate: Dict[int, float] = {}
             for line in lines:
                 aggregate[line.prod_id] = aggregate.get(line.prod_id, 0.0) + float(line.weight_sold)
@@ -277,7 +273,7 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
                 if qty > balances.get(pid, 0.0):
                     raise HTTPException(status_code=409, detail=f"insufficient balance for product {pid}: {qty} > {balances.get(pid, 0.0)}")
 
-            # 5) แทรกขายออก 
+            # 4) แทรกขายออก 
             insert_sql = text("""
                 INSERT INTO stock_sales (prod_id, weight_sold)
                 VALUES (:pid, :qty)
