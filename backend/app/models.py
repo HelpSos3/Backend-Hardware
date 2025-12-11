@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS stock_sales (
     prod_id INT,
     weight_sold DECIMAL(10,2) CHECK (weight_sold IS NULL OR weight_sold >= 0),
     sale_date TIMESTAMPTZ DEFAULT now(),
+    note TEXT ,
     FOREIGN KEY (prod_id) REFERENCES product(prod_id)
 );
 

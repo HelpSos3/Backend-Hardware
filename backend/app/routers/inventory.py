@@ -83,6 +83,7 @@ class HistoryRow(BaseModel):
     weight: float
     price: Optional[float] = None
     date: datetime
+    note: Optional[str] = None
 
 # เรียกดูประวัติซื้อ/ขาย
 class HistoryListResponse(BaseModel):
@@ -100,7 +101,7 @@ class HistoryListResponse(BaseModel):
 
 SortKey = Literal["last_sale_date","-last_sale_date","name","-name","balance","-balance"]
 
-# ----------- GET /inventory/items -----------
+# ตารางคลังสินค้า
 @router.get("/items", response_model=InventoryListResponse)
 def list_inventory_items(
     category_id: Optional[int] = Query(None),
@@ -216,7 +217,7 @@ def list_inventory_items(
     per_page=per_page
 )
 
-# ----------- POST /stock_sales/bulk -----------
+# ขายสินค้า
 @router.post("/sell", response_model=SellBulkResult)
 def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
     if not lines:
@@ -275,17 +276,18 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
 
             # 4) แทรกขายออก 
             insert_sql = text("""
-                INSERT INTO stock_sales (prod_id, weight_sold)
-                VALUES (:pid, :qty)
-                RETURNING stock_sales_id, sale_date
+                INSERT INTO stock_sales (prod_id, weight_sold , note)
+                VALUES (:pid, :qty , :note)
+                RETURNING stock_sales_id, sale_date , note
             """)
             for line in lines:
-                row = db.execute(insert_sql, {"pid": line.prod_id, "qty": float(line.weight_sold)}).mappings().first()
+                row = db.execute(insert_sql, {"pid": line.prod_id, "qty": float(line.weight_sold), "note": line.note}).mappings().first()
                 created.append({
                     "prod_id": line.prod_id,
                     "weight_sold": float(line.weight_sold),
                     "stock_sales_id": row["stock_sales_id"],
-                    "sale_date": row["sale_date"].isoformat() if row["sale_date"] else None
+                    "sale_date": row["sale_date"].isoformat() if row["sale_date"] else None,
+                    "note": row["note"]
                 })
 
         return SellBulkResult(ok=True, created=created)
@@ -294,108 +296,8 @@ def sell_bulk(lines: List[SellLine], db: Session = Depends(get_db)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-# ----------- GET /inventory/export -----------
-@router.get("/export")
-def export_inventory_excel(
-    category_id: Optional[int] = Query(None),
-    q: Optional[str] = Query(None),
-    only_active: bool = Query(True),
-    sort: SortKey = Query("-last_sale_date"),
-    db: Session = Depends(get_db),
-):
-    sql = """
-WITH latest_sale AS (
-  SELECT
-    ss.prod_id,
-    ss.weight_sold,
-    ss.sale_date,
-    ROW_NUMBER() OVER (
-      PARTITION BY ss.prod_id
-      ORDER BY ss.sale_date DESC, ss.stock_sales_id DESC
-    ) AS rn
-  FROM stock_sales ss
-),
-agg_latest AS (
-  SELECT
-    prod_id,
-    sale_date   AS last_sale_date,
-    weight_sold AS last_sold_qty
-  FROM latest_sale
-  WHERE rn = 1
-)
-SELECT
-  p.prod_id,
-  p.prod_name,
-  p.prod_img,
-  pc.category_id,
-  pc.category_name,
-  (COALESCE(pit.purchased_weight,0) - COALESCE(pit.sold_weight,0)) AS balance_weight,
-  al.last_sale_date,
-  al.last_sold_qty
-FROM product p
-LEFT JOIN product_categories pc ON pc.category_id = p.category_id
-LEFT JOIN product_inventory_totals pit ON pit.prod_id = p.prod_id
-LEFT JOIN agg_latest al ON al.prod_id = p.prod_id      -- << เปลี่ยนจาก JOIN เป็น LEFT JOIN
-WHERE (:only_active = FALSE OR p.is_active = TRUE)
-  AND (:category_id IS NULL OR p.category_id = :category_id)
-  AND (
-       :q IS NULL OR :q = ''
-    OR  p.prod_name ILIKE '%'||:q||'%'
-    OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
-    OR  p.prod_id::text = :q
-  )
-ORDER BY
-  CASE WHEN :sort='-last_sale_date' THEN al.last_sale_date END DESC NULLS LAST,
-  CASE WHEN :sort='last_sale_date'  THEN al.last_sale_date END ASC  NULLS FIRST,
-  CASE WHEN :sort='-balance'        THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END DESC,
-  CASE WHEN :sort='balance'         THEN (COALESCE(pit.purchased_weight,0)-COALESCE(pit.sold_weight,0)) END ASC,
-  CASE WHEN :sort='-name'           THEN p.prod_name END DESC,
-  CASE WHEN :sort='name'            THEN p.prod_name END ASC,
-  p.prod_id ASC
-"""
-    rows = db.execute(text(sql), {
-        "category_id": category_id,
-        "q": q,
-        "only_active": only_active,
-        "sort": sort
-    }).mappings().all()
 
-    #สร้างไฟล์ Excel ด้วย openpyxl
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "รายงานคลังสินค้า"
-
-    headers = ["รหัส", "ชื่อสินค้า", "หมวดหมู่", "คงเหลือ (kg)", "วันที่ขายล่าสุด", "จำนวนที่ขายล่าสุด (kg)"]
-    ws.append(headers)
-
-    for r in rows:
-        prod_code = f'#{str(r["prod_id"]).zfill(3)}'
-        last_date = r["last_sale_date"].strftime("%Y-%m-%d %H:%M") if r["last_sale_date"] else ""
-        ws.append([
-            prod_code,
-            r["prod_name"] or "",
-            r["category_name"] or "",
-            float(r["balance_weight"]) if r["balance_weight"] is not None else 0.0,
-            last_date,
-            float(r["last_sold_qty"]) if r["last_sold_qty"] is not None else ""
-        ])
-
-    # พื้นที่สำหรับเก็บข้อมูลแบบไฟล์ แต่เก็บ ไว้ใน RAM
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
-
-
-    filename = "รายงานคลังสินค้า.xlsx"
-    encoded_name = quote(filename)
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
-    # ส่งไฟล์ให้เบราว์เซอร์ดาวน์โหลด
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers=headers,
-    )
-
+ # สินค้าที่รับซื้อมาทั้งหมด ของแต่ล่ะสินค้า
 @router.get("/purchased_history_simple/{prod_id}", response_model=HistoryListResponse)
 def get_purchased_history_simple(
     prod_id: int,
@@ -416,16 +318,18 @@ def get_purchased_history_simple(
 
     list_sql = text("""
         SELECT
-          pi.prod_id,
-          p.prod_name,
-          pi.weight,
-          pi.price,
-          pi.purchase_items_date AS date
+        pi.prod_id,
+        p.prod_name,
+        pi.weight,
+        pi.price,
+        pi.purchase_items_date AS date
         FROM purchase_items pi
+        JOIN purchases pu ON pu.purchase_id = pi.purchase_id   
         LEFT JOIN product p ON p.prod_id = pi.prod_id
         WHERE pi.prod_id = :pid
-          AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
+        AND pu.purchase_status = 'DONE'                       
+        AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+        AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
         ORDER BY pi.purchase_items_date DESC, pi.purchase_item_id DESC
         LIMIT :limit OFFSET :offset
     """)
@@ -433,9 +337,11 @@ def get_purchased_history_simple(
     count_sql = text("""
         SELECT COUNT(*)
         FROM purchase_items pi
+        JOIN purchases pu ON pu.purchase_id = pi.purchase_id    
         WHERE pi.prod_id = :pid
-          AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
+        AND pu.purchase_status = 'DONE'                       
+        AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+        AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
     """)
 
     params = {
@@ -469,7 +375,7 @@ def get_purchased_history_simple(
     per_page=per_page
 )
 
-
+ # สินค้าที่นำไปขายทั้งหมด ของแต่ล่ะสินค้า
 @router.get("/sold_history_simple/{prod_id}", response_model=HistoryListResponse)
 def get_sold_history_simple(
     prod_id: int,
@@ -490,10 +396,11 @@ def get_sold_history_simple(
 
     list_sql = text("""
         SELECT
-          ss.prod_id,
-          p.prod_name,
-          ss.weight_sold AS weight,
-          ss.sale_date    AS date
+        ss.prod_id,
+        p.prod_name,
+        ss.weight_sold AS weight,
+        ss.sale_date AS date,
+        ss.note
         FROM stock_sales ss
         LEFT JOIN product p ON p.prod_id = ss.prod_id
         WHERE ss.prod_id = :pid
@@ -528,6 +435,7 @@ def get_sold_history_simple(
             prod_name=r["prod_name"],
             weight=float(r["weight"]),
             date=r["date"],
+            note=r["note"]
         )
         for r in rows
     ]
@@ -555,33 +463,36 @@ def export_purchased_excel(
     date_to_exclusive = _make_date_to_exclusive(date_to)
 
     sql = text("""
-WITH filtered_product AS (
-  SELECT p.prod_id, p.prod_name, p.prod_img, p.category_id
-  FROM product p
-  WHERE (:only_active = FALSE OR p.is_active = TRUE)
-    AND (:category_id IS NULL OR p.category_id = :category_id)
-    AND (
-         :q IS NULL OR :q = ''
-      OR  p.prod_name ILIKE '%'||:q||'%'
-      OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
-      OR  p.prod_id::text = :q
+    WITH filtered_product AS (
+    SELECT p.prod_id, p.prod_name, p.prod_img, p.category_id
+    FROM product p
+    WHERE (:only_active = FALSE OR p.is_active = TRUE)
+        AND (:category_id IS NULL OR p.category_id = :category_id)
+        AND (
+            :q IS NULL OR :q = ''
+        OR  p.prod_name ILIKE '%'||:q||'%'
+        OR  ('#' || LPAD(p.prod_id::text, 3, '0')) ILIKE '%'||:q||'%'
+        OR  p.prod_id::text = :q
+        )
+        AND (:ids_is_null OR p.prod_id = ANY(:ids))
     )
-    AND (:ids_is_null OR p.prod_id = ANY(:ids))
-)
-SELECT
-  fp.prod_id,
-  fp.prod_name,
-  pc.category_name,
-  pi.weight,
-  pi.price,
-  pi.purchase_items_date AS dt
-FROM purchase_items pi
-JOIN filtered_product fp ON fp.prod_id = pi.prod_id
-LEFT JOIN product_categories pc ON pc.category_id = fp.category_id
-WHERE (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
-  AND (:date_to_ex IS NULL OR pi.purchase_items_date < :date_to_ex)
-ORDER BY pi.purchase_items_date DESC, pi.purchase_item_id DESC
-""")
+    SELECT
+    fp.prod_id,
+    fp.prod_name,
+    pc.category_name,
+    pi.weight,
+    pi.price,
+    pi.purchase_items_date AS dt
+    FROM purchase_items pi
+    JOIN purchases pu ON pu.purchase_id = pi.purchase_id        
+    JOIN filtered_product fp ON fp.prod_id = pi.prod_id
+    LEFT JOIN product_categories pc ON pc.category_id = fp.category_id
+    WHERE pu.purchase_status = 'DONE'                           
+    AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+    AND (:date_to_ex IS NULL OR pi.purchase_items_date < :date_to_ex)
+    ORDER BY pi.purchase_items_date DESC, pi.purchase_item_id DESC
+    """)
+
 
     rows = db.execute(sql, {
         "only_active": only_active,
