@@ -10,6 +10,7 @@ from .routers import products, categories
 from .routers import purchases, purchase_items, payments
 from .routers import inventory
 from .routers import customers
+from .routers import purchase_order
 
 app = FastAPI(title="Scrap Shop Backend")
 
@@ -53,7 +54,7 @@ app.include_router(payments.router)
 
 app.include_router(inventory.router)
 app.include_router(customers.router)
-
+app.include_router(purchase_order.router)
 
 
 # health check
