@@ -21,6 +21,7 @@ def get_db():
 # ---------- Pydantic Models ----------
 class PurchaseItem(BaseModel):
     purchase_item_id: int
+    prod_id: int
     prod_name: str
     category_name: str
     purchase_date: str
@@ -85,6 +86,7 @@ def list_purchase_items(
     sql = text("""
     SELECT
         pi.purchase_item_id,
+        pi.prod_id AS prod_id,
         pr.prod_name,
         cat.category_name,
         TO_CHAR(pi.purchase_items_date, 'DD/MM/YYYY') AS purchase_date,
