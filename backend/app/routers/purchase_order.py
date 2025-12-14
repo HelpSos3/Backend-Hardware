@@ -28,7 +28,7 @@ class PurchaseItem(BaseModel):
     weight: float
     price: float
     payment_method: Optional[str]
-
+    image: Optional[str]
 
 class PurchaseItemResponse(BaseModel):
     items: List[PurchaseItem]
@@ -83,34 +83,47 @@ def list_purchase_items(
 
     # ---------- DATA ----------
     sql = text("""
-        SELECT
-            pi.purchase_item_id,
-            pr.prod_name,
-            cat.category_name,
-            TO_CHAR(pi.purchase_items_date, 'DD/MM/YYYY') AS purchase_date,
-            TO_CHAR(pi.purchase_items_date, 'HH24:MI')    AS purchase_time,
-            pi.weight,
-            pi.price,
-            pay.payment_method
-        FROM purchase_items pi
-        JOIN product pr             ON pr.prod_id = pi.prod_id
-        JOIN product_categories cat ON cat.category_id = pr.category_id
-        LEFT JOIN purchases pu      ON pu.purchase_id = pi.purchase_id
-        LEFT JOIN payment pay       ON pay.purchase_id = pi.purchase_id
-        WHERE (:q IS NULL OR pr.prod_name ILIKE '%' || :q || '%')
-          AND (:category_id IS NULL OR pr.category_id = :category_id)
-          AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
-          AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
-        ORDER BY pi.purchase_items_date DESC
-        LIMIT :limit OFFSET :offset
-    """)
+    SELECT
+        pi.purchase_item_id,
+        pr.prod_name,
+        cat.category_name,
+        TO_CHAR(pi.purchase_items_date, 'DD/MM/YYYY') AS purchase_date,
+        TO_CHAR(pi.purchase_items_date, 'HH24:MI')    AS purchase_time,
+        pi.weight,
+        pi.price,
+        pay.payment_method,
+        pip.img_path AS image
+    FROM purchase_items pi
+    JOIN product pr             ON pr.prod_id = pi.prod_id
+    JOIN product_categories cat ON cat.category_id = pr.category_id
+    LEFT JOIN purchases pu      ON pu.purchase_id = pi.purchase_id
+    LEFT JOIN payment pay       ON pay.purchase_id = pi.purchase_id
+    LEFT JOIN purchase_item_photos pip
+           ON pip.purchase_item_id = pi.purchase_item_id
+    WHERE (:q IS NULL OR pr.prod_name ILIKE '%' || :q || '%')
+      AND (:category_id IS NULL OR pr.category_id = :category_id)
+      AND (:date_from IS NULL OR pi.purchase_items_date >= :date_from)
+      AND (:date_to_exclusive IS NULL OR pi.purchase_items_date < :date_to_exclusive)
+    ORDER BY pi.purchase_items_date DESC
+    LIMIT :limit OFFSET :offset
+""")
+
 
     rows = db.execute(sql, params).mappings().all()
 
     total_pages = (total_items + per_page - 1) // per_page
 
+    BASE_URL = "http://localhost:8080"
+
+    items = []
+    for r in rows:
+        row = dict(r)
+        if row.get("image"):
+            row["image"] = f"{BASE_URL}/{row['image']}"
+        items.append(row)
+
     return PurchaseItemResponse(
-        items=rows,
+        items=items,
         total_items=total_items,
         total_pages=total_pages,
         current_page=page,
