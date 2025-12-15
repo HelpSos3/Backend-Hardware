@@ -121,7 +121,7 @@ def list_purchase_items(
     for r in rows:
         row = dict(r)
         if row.get("image"):
-            row["image"] = f"{BASE_URL}/{row['image']}"
+            row["image"] = f"{BASE_URL.rstrip('/')}/{row['image'].lstrip('/')}"
         items.append(row)
 
     return PurchaseItemResponse(
