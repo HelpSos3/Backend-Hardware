@@ -131,6 +131,11 @@ class ProductOut(BaseModel):
     is_active: bool
     prod_img: Optional[str] = None
 
+class ScaleReadOut(BaseModel):
+    weight: Optional[float] = None
+    unit: Optional[str] = None
+    stable: Optional[bool] = None    
+
 # ---------- Photo Helpers ----------
 def _get_item_photos(db: Session, item_id: int) -> List[PhotoOut]:
     rows = db.execute(
@@ -213,7 +218,6 @@ def items_summary(purchase_id: int, db: Session = Depends(get_db)):
       FROM purchase_items
       WHERE purchase_id = :pid
     """), {"pid": purchase_id}).mappings().first()
-    # ✅ ปลอดภัยกับ Decimal
     return JSONResponse(content=jsonable_encoder(dict(row), custom_encoder={Decimal: str}))
 
 
@@ -441,3 +445,49 @@ def delete_purchase_item(
             pass
 
     return Response(status_code=204)
+
+# ---------- SCALE (อ่านน้ำหนักจากหัว A12E) ----------
+@router.get("/scale/read", response_model=ScaleReadOut)
+def read_scale_from_hardware(
+    timeout_ms: int = Query(500, ge=100, le=5000),
+    lines: int = Query(5, ge=1, le=20),
+):
+    """
+    อ่านน้ำหนักจากหัวชั่ง A12E
+    (proxy ไป hardware_service)
+    """
+    try:
+        with httpx.Client(timeout=httpx.Timeout(3.0)) as client:
+            resp = client.get(
+                f"{HARDWARE_URL}/scale/read",
+                params={
+                    "timeout_ms": timeout_ms,
+                    "lines": lines,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=502,
+            detail="ไม่สามารถเชื่อมต่อ hardware service (scale) ได้"
+        )
+
+    except httpx.ReadTimeout:
+        raise HTTPException(
+            status_code=504,
+            detail="hardware service (scale) ตอบช้าเกินไป"
+        )
+
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"hardware service (scale) error: {e}"
+        )
+
+    return ScaleReadOut(
+        weight=data.get("weight"),
+        unit=data.get("unit"),
+        stable=data.get("stable"),
+    )
