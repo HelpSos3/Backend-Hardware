@@ -85,7 +85,10 @@ def list_customers(
                 ) AS last_purchase_date
             FROM customers c
             LEFT JOIN customer_photos cp ON cp.customer_id = c.customer_id
-            WHERE (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
+            WHERE 
+               c.full_name IS NOT NULL
+               AND c.address IS NOT NULL 
+               AND (:q IS NULL OR c.full_name ILIKE '%' || :q || '%')
             ORDER BY 
                 c.full_name NULLS LAST,
                 c.customer_id ASC
