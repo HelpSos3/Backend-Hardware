@@ -34,7 +34,7 @@ services:
     env_file:
       - .env
     environment:
-      HARDWARE_URL: http://host.docker.internal:9000  # << ใช้คุยกับ hardware_service
+      HARDWARE_URL: http://host.docker.internal:9000  
       UPLOAD_ROOT: /app/uploads    
     depends_on:
       - db

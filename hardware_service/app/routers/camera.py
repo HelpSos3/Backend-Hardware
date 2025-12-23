@@ -1,34 +1,33 @@
 # hardware_service/app/routers/camera.py
 from fastapi import APIRouter, Response, HTTPException, Query
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse
 import cv2
 import time
 import os
 import numpy as np
 from typing import Optional
+from pydantic import BaseModel
+
+from app.services.camera_config import load_camera_config, save_camera_config
 
 router = APIRouter(prefix="/camera", tags=["camera"])
 
 # ===== Config =====
 SCAN_MAX = int(os.getenv("CAMERA_SCAN_MAX", "6"))
-DEFAULT_WARMUP = int(os.getenv("CAMERA_WARMUP", "8"))
+DEFAULT_WARMUP = int(os.getenv("CAMERA_WARMUP", "3"))
 DEFAULT_FPS = int(os.getenv("CAMERA_FPS", "15"))
 DEFAULT_JPEG_QUALITY = int(os.getenv("CAMERA_JPEG_QUALITY", "85"))
 
-# ===== Helpers (Windows-only backends) =====
-def _backend_from_str(name: str) -> int:
-    n = (name or "auto").lower()
-    if n == "dshow":
-        return getattr(cv2, "CAP_DSHOW", 0)
-    if n == "msmf":
-        return getattr(cv2, "CAP_MSMF", 0)
-    return 0  # auto
+# ===== Models =====
+class CameraConfigRequest(BaseModel):
+    active_camera: int | None = None
 
+
+# ===== Helpers =====
 def _try_open(idx: int) -> Optional[cv2.VideoCapture]:
-    # ลองเปิดเฉพาะ backend ของ Windows: DirectShow → Media Foundation
     for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
         cap = cv2.VideoCapture(idx, backend)
-        if cap is not None and cap.isOpened():
+        if cap and cap.isOpened():
             return cap
         try:
             cap.release()
@@ -36,152 +35,143 @@ def _try_open(idx: int) -> Optional[cv2.VideoCapture]:
             pass
     return None
 
-def _open_cam_with_backend(device_index: int, backend_name: str) -> Optional[cv2.VideoCapture]:
-    if device_index < 0 or device_index > SCAN_MAX:
+
+def _open_camera(idx: int) -> Optional[cv2.VideoCapture]:
+    if idx < 0 or idx > SCAN_MAX:
         return None
-    be = _backend_from_str(backend_name)
-    if be == 0:
-        return _try_open(device_index)  # auto
-    cap = cv2.VideoCapture(device_index, be)
-    if cap is not None and cap.isOpened():
-        return cap
-    try:
-        cap.release()
-    except Exception:
-        pass
-    return None
+    return _try_open(idx)
 
-def _set_if_supported(cap: cv2.VideoCapture, prop: int, value: float):
-    try:
-        cap.set(prop, value)
-    except Exception:
-        pass
 
-def _apply_fourcc(cap: cv2.VideoCapture, codec: str):
-    up = (codec or "AUTO").upper()
-    if up in ("MJPG", "YUY2"):
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*up)
-            cap.set(cv2.CAP_PROP_FOURCC, float(fourcc))
-        except Exception:
-            pass
-
-def _configure_cap_standard(cap, width, height, fps, codec="AUTO"):
-    _set_if_supported(cap, cv2.CAP_PROP_FRAME_WIDTH,  float(width))
-    _set_if_supported(cap, cv2.CAP_PROP_FRAME_HEIGHT, float(height))
-    _set_if_supported(cap, cv2.CAP_PROP_FPS,          float(fps))
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        _set_if_supported(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
-
-def _configure_cap_quick(cap, width, height, codec_hint="AUTO", set_fps=None):
-    try:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  float(width))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
-    except Exception:
-        pass
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-    if set_fps is not None:
-        try:
-            cap.set(cv2.CAP_PROP_FPS, float(set_fps))
-        except Exception:
-            pass
-
-def _should_quick_path(backend, codec, fps, fps_strategy):
-    s  = (fps_strategy or "auto").lower()
-    be = (backend or "auto").lower()
-    co = (codec   or "AUTO").upper()
-    if s == "skip":
-        return True, None
-    if s == "force":
-        return False, float(fps)
-    if be == "dshow" and co == "YUY2" and float(fps) >= 50.0:
-        return True, None
-    return False, float(fps)
-
-def _warmup(cap, warmup):
-    for _ in range(max(0, warmup)):
-        cap.read()
-        time.sleep(0.06)
-
-def _black_jpeg(w, h, quality=DEFAULT_JPEG_QUALITY):
-    black = np.zeros((int(h), int(w), 3), dtype=np.uint8)
-    ok, buf = cv2.imencode(".jpg", black, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    return buf.tobytes() if ok else b""
-
-def _encode_jpeg(frame, quality=DEFAULT_JPEG_QUALITY):
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    return buf.tobytes() if ok else b""
-
-def _backend_name(be: int) -> str:
-    return (
-        "dshow" if be == getattr(cv2, "CAP_DSHOW", -1) else
-        "msmf"  if be == getattr(cv2, "CAP_MSMF", -1) else
-        "auto"  if be == 0 else str(be)
+def _encode_jpeg(frame, quality=DEFAULT_JPEG_QUALITY) -> bytes:
+    ok, buf = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
     )
+    return buf.tobytes() if ok else b""
+
+
+def _black_jpeg(w, h, quality=DEFAULT_JPEG_QUALITY) -> bytes:
+    black = np.zeros((h, w, 3), dtype=np.uint8)
+    return _encode_jpeg(black, quality)
+
+
+def get_active_camera_index() -> int:
+    cfg = load_camera_config()
+
+    idx = cfg.get("active_camera")
+    if idx is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Camera is not configured"
+        )
+
+    return idx
+
+
 
 # ===== Routes =====
 
-# --- Capture ---
+# --- List devices (for Settings page) ---
+@router.get("/devices")
+def list_camera_devices():
+    devices = []
+
+    for idx in range(SCAN_MAX + 1):
+        cap = _try_open(idx)
+        if cap:
+            ok, _ = cap.read()
+            cap.release()
+            devices.append({
+                "index": idx,
+                "status": "available" if ok else "unavailable"
+            })
+        else:
+            devices.append({
+                "index": idx,
+                "status": "unavailable"
+            })
+
+    return {"devices": devices}
+
+
+# --- Get current config ---
+@router.get("/config")
+def get_camera_config():
+    return load_camera_config()
+
+
+# --- Set active camera ---
+@router.post("/config")
+def set_camera_config(req: CameraConfigRequest):
+    cfg = load_camera_config()
+
+    cfg["active_camera"] = req.active_camera
+
+    save_camera_config(cfg)
+
+    return {
+        "message": "camera config saved",
+        "config": cfg
+    }
+
+
+# --- Capture single image ---
 @router.post("/capture", response_class=Response)
 def capture(
-    device_index: int = Query(0, ge=0, le=SCAN_MAX),
     width: int = Query(1280, ge=1),
     height: int = Query(720, ge=1),
-    warmup: int = Query(3, ge=0),
-    fps: int = Query(15, ge=1),
+    warmup: int = Query(DEFAULT_WARMUP, ge=0),
     jpeg_quality: int = Query(DEFAULT_JPEG_QUALITY, ge=1, le=100),
-    backend: str = Query("msmf"),
-    codec: str = Query("MJPG"),
-    fps_strategy: str = Query("auto")
 ):
-    cap = _open_cam_with_backend(device_index, backend)
+    idx = get_active_camera_index()
+
+    cap = _open_camera(idx)
     if cap is None:
-        raise HTTPException(status_code=400, detail=f"Invalid camera index/backend: idx={device_index}, backend={backend}")
+        raise HTTPException(400, "Camera not available")
+
     try:
-        _apply_fourcc(cap, codec)
-        use_quick, set_fps_value = _should_quick_path(backend, codec, fps, fps_strategy)
-        if use_quick:
-            _configure_cap_quick(cap, width, height, codec_hint=codec, set_fps=set_fps_value)
-        else:
-            _configure_cap_standard(cap, width, height, set_fps_value if set_fps_value else fps, codec=codec)
-        _warmup(cap, warmup)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        for _ in range(warmup):
+            cap.read()
+            time.sleep(0.05)
+
         ok, frame = cap.read()
     finally:
         cap.release()
-    if not ok or frame is None or frame.size == 0:
-        raise HTTPException(status_code=500, detail="Capture failed")
-    data = _encode_jpeg(frame, quality=jpeg_quality)
-    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    if not ok or frame is None:
+        raise HTTPException(500, "Capture failed")
+
+    data = _encode_jpeg(frame, jpeg_quality)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"}
+    )
+
 
 # --- Preview (MJPEG stream) ---
 @router.get("/preview")
 def preview(
-    device_index: int = Query(0, ge=0, le=SCAN_MAX),
     width: int = Query(1280, ge=1),
     height: int = Query(720, ge=1),
-    warmup: int = Query(3, ge=0),
-    fps: int = Query(15, ge=1),
+    fps: int = Query(DEFAULT_FPS, ge=1),
     jpeg_quality: int = Query(DEFAULT_JPEG_QUALITY, ge=1, le=100),
-    backend: str = Query("msmf"),
-    codec: str = Query("MJPG"),
-    fps_strategy: str = Query("auto")
 ):
-    cap = _open_cam_with_backend(device_index, backend)
-    if cap is None:
-        raise HTTPException(status_code=400, detail=f"Invalid camera index/backend: idx={device_index}, backend={backend}")
-    _apply_fourcc(cap, codec)
-    use_quick, set_fps_value = _should_quick_path(backend, codec, fps, fps_strategy)
-    if use_quick:
-        _configure_cap_quick(cap, width, height, codec_hint=codec, set_fps=set_fps_value)
-    else:
-        _configure_cap_standard(cap, width, height, set_fps_value if set_fps_value else fps, codec=codec)
-    _warmup(cap, warmup)
+    idx = get_active_camera_index()
 
-    delay = max(1.0 / float(fps), 0.001)
+    cap = _open_camera(idx)
+    if cap is None:
+        raise HTTPException(400, "Camera not available")
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    delay = max(1.0 / fps, 0.001)
+
     def gen():
         try:
             while True:
@@ -190,17 +180,19 @@ def preview(
                     chunk = _black_jpeg(width, height, jpeg_quality)
                 else:
                     chunk = _encode_jpeg(frame, jpeg_quality)
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + chunk + b"\r\n"
+
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + chunk +
+                    b"\r\n"
+                )
                 time.sleep(delay)
-        except GeneratorExit:
-            pass
         finally:
             cap.release()
 
     return StreamingResponse(
         gen(),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+        headers={"Cache-Control": "no-store"}
     )
-
-
